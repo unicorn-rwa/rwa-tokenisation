@@ -26,9 +26,10 @@ abstract contract BaseTest is Test {
     address internal admin    = makeAddr("admin");
     address internal attester = makeAddr("attester");
     address internal multisig = makeAddr("multisig");
-    address internal alice    = makeAddr("alice");   // US accredited
-    address internal bob      = makeAddr("bob");     // UA Reg S
+    address internal alice    = makeAddr("alice");   // US accredited     (Reg D 506c, cap $25k)
+    address internal bob      = makeAddr("bob");     // UA Reg S           (no cap)
     address internal charlie  = makeAddr("charlie"); // no KYC
+    address internal dave     = makeAddr("dave");    // US non-accredited  (Reg D 506b, cap $2.5k)
 
     // ─── Contracts ─────────────────────────────────────────────────────────────
     MockUSDC              internal usdc;
@@ -37,10 +38,12 @@ abstract contract BaseTest is Test {
     PropertyFundingFactory internal factory;
 
     // Default project params — override in individual tests as needed
-    uint256 internal constant FUNDING_GOAL   = 200_000e6; // $200k USDC
-    uint256 internal constant MIN_INVESTMENT =   2_000e6; // $2k USDC
-    uint256 internal constant ROI_BPS        = 1_500;     // 15%
-    uint256 internal constant DEADLINE_OFFSET = 30 days;
+    uint256 internal constant FUNDING_GOAL                = 200_000e6; // $200k USDC
+    uint256 internal constant MIN_INVESTMENT              =   2_000e6; // $2k USDC
+    uint256 internal constant MAX_ACCREDITED_INVESTMENT   =  25_000e6; // $25k — Reg D 506(c) cap
+    uint256 internal constant MAX_NON_ACCREDITED_INVESTMENT =  2_500e6; // $2.5k — Reg D 506(b) cap
+    uint256 internal constant ROI_BPS                     = 1_500;     // 15%
+    uint256 internal constant DEADLINE_OFFSET             = 30 days;
 
     // ─── setUp ─────────────────────────────────────────────────────────────────
     function setUp() public virtual {
@@ -55,33 +58,53 @@ abstract contract BaseTest is Test {
             address(registry),
             address(distributor)
         );
+        distributor.setFactory(address(factory));
         vm.stopPrank();
 
         // Issue KYC attestations via the attester wallet
         vm.startPrank(attester);
 
-        // Alice — US accredited investor (Reg D 506c)
+        // Alice — US accredited investor (Reg D 506c, cap $25k/project)
         registry.issueAttestation(
             alice,
             true,  // accreditedInvestor
+            false, // nonAccreditedUS
             false, // regSEligible
             "US",
             uint64(block.timestamp + 365 days),
             bytes32(0)
         );
 
-        // Bob — Ukrainian investor (Reg S)
+        // Bob — Ukrainian investor (Reg S, no cap)
         registry.issueAttestation(
             bob,
             false, // accreditedInvestor
+            false, // nonAccreditedUS
             true,  // regSEligible
             "UA",
             uint64(block.timestamp + 365 days),
             bytes32(0)
         );
-        // Charlie gets no attestation — all invest calls should revert
 
+        // Dave — US non-accredited investor (Reg D 506b, cap $2.5k/project)
+        registry.issueAttestation(
+            dave,
+            false, // accreditedInvestor
+            true,  // nonAccreditedUS
+            false, // regSEligible
+            "US",
+            uint64(block.timestamp + 365 days),
+            bytes32(0)
+        );
+
+        // Charlie gets no attestation — all invest calls should revert
         vm.stopPrank();
+
+        // US is restricted by default in KYCRegistry constructor (V1: non-US only).
+        // Allow it here so general tests using alice/dave can exercise invest() paths.
+        // Dedicated country-restriction tests call restrictCountry("US") themselves.
+        vm.prank(admin);
+        registry.allowCountry("US");
     }
 
     // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -102,6 +125,8 @@ abstract contract BaseTest is Test {
             block.timestamp + 60 days,
             block.timestamp + 540 days,
             MIN_INVESTMENT,
+            MAX_ACCREDITED_INVESTMENT,
+            MAX_NON_ACCREDITED_INVESTMENT,
             "ipfs://QmTestHash"
         );
         funding = PropertyFunding(f);

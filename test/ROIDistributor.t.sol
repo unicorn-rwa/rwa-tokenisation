@@ -27,10 +27,10 @@ contract ROIDistributorTest is BaseTest {
         _advanceToCompleted();
 
         // Build Merkle tree off-chain (here: inline in test)
-        // Alice invested 120k, Bob invested 80k, 15% ROI
-        aliceClaim = 120_000e6 + (120_000e6 * ROI_BPS / 10_000); // 138_000e6
-        bobClaim   =  80_000e6 + ( 80_000e6 * ROI_BPS / 10_000); //  92_000e6
-        totalPayout = aliceClaim + bobClaim; // 230_000e6
+        // Alice (accredited, $25k cap) + Bob (Reg S, no cap) → total $200k, 15% ROI
+        aliceClaim = 25_000e6 + (25_000e6 * ROI_BPS / 10_000);   //  28_750e6
+        bobClaim   = 175_000e6 + (175_000e6 * ROI_BPS / 10_000); // 201_250e6
+        totalPayout = aliceClaim + bobClaim; // 230_000e6 (same total — 15% on $200k)
 
         (merkleRoot, aliceProof, bobProof) = _buildMerkleTree(alice, aliceClaim, bob, bobClaim);
 
@@ -54,11 +54,11 @@ contract ROIDistributorTest is BaseTest {
     function test_DepositReturns_EmitsEvent() public {
         // Create a second project to test fresh deposit event
         (PropertyFunding f2,) = _createProject();
-        // Must sum to FUNDING_GOAL (200_000e6) to reach FUNDED state
-        _advanceToCompletedFor(f2, 100_000e6, 100_000e6);
+        // alice=$25k (Reg D cap), bob=$175k (Reg S, no cap) — sums to FUNDING_GOAL
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
 
-        uint256 payout = 50_000e6 + (50_000e6 * ROI_BPS / 10_000) +
-                         50_000e6 + (50_000e6 * ROI_BPS / 10_000);
+        uint256 payout = 25_000e6 + (25_000e6 * ROI_BPS / 10_000) +
+                         175_000e6 + (175_000e6 * ROI_BPS / 10_000);
         bytes32 newRoot = keccak256("testroot");
 
         usdc.mint(admin, payout);
@@ -86,7 +86,7 @@ contract ROIDistributorTest is BaseTest {
 
     function test_RevertWhen_NonAdminDeposits() public {
         (PropertyFunding f2,) = _createProject();
-        _advanceToCompletedFor(f2, FUNDING_GOAL / 2, FUNDING_GOAL / 2);
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6); // alice=Reg D cap, bob=Reg S (no cap)
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -163,10 +163,10 @@ contract ROIDistributorTest is BaseTest {
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
-    /// @dev Advance the default project to COMPLETED with alice=120k, bob=80k
+    /// @dev Advance the default project to COMPLETED with alice=$25k (Reg D cap), bob=$175k (Reg S, no cap)
     function _advanceToCompleted() internal {
-        uint256 aliceAmount = 120_000e6;
-        uint256 bobAmount   =  80_000e6;
+        uint256 aliceAmount =  25_000e6;
+        uint256 bobAmount   = 175_000e6;
 
         _fundInvestor(alice, address(funding), aliceAmount);
         _fundInvestor(bob,   address(funding), bobAmount);

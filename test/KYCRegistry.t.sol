@@ -29,14 +29,16 @@ contract KYCRegistryTest is BaseTest {
     function test_IssueAttestation_EmitsEvent() public {
         address newInvestor = makeAddr("newInvestor");
 
-        // vm.expectEmit(checkTopic1, checkTopic2, checkTopic3, checkData)
         vm.expectEmit(true, false, false, true);
-        emit KYCRegistry.AttestationIssued(newInvestor, true, false, "US", uint64(block.timestamp + 365 days));
+        emit KYCRegistry.AttestationIssued(newInvestor, true, false, false, "US", uint64(block.timestamp + 365 days));
 
         vm.prank(attester);
         registry.issueAttestation(
             newInvestor,
-            true, false, "US",
+            true,  // accreditedInvestor
+            false, // nonAccreditedUS
+            false, // regSEligible
+            "US",
             uint64(block.timestamp + 365 days),
             bytes32(0)
         );
@@ -47,7 +49,7 @@ contract KYCRegistryTest is BaseTest {
         address investor = makeAddr("investor");
 
         vm.prank(attester);
-        registry.issueAttestation(investor, true, false, "US", uint64(block.timestamp + 365 days), pmHash);
+        registry.issueAttestation(investor, true, false, false, "US", uint64(block.timestamp + 365 days), pmHash);
 
         vm.prank(attester);
         assertEq(registry.getWalletByPmIdHash(pmHash), investor);
@@ -62,13 +64,13 @@ contract KYCRegistryTest is BaseTest {
             )
         );
         vm.prank(charlie);
-        registry.issueAttestation(alice, true, false, "US", uint64(block.timestamp + 1), bytes32(0));
+        registry.issueAttestation(alice, true, false, false, "US", uint64(block.timestamp + 1), bytes32(0));
     }
 
     function test_RevertWhen_ZeroAddressIssued() public {
         vm.expectRevert(KYCRegistry.ZeroAddress.selector);
         vm.prank(attester);
-        registry.issueAttestation(address(0), true, false, "US", uint64(block.timestamp + 1), bytes32(0));
+        registry.issueAttestation(address(0), true, false, false, "US", uint64(block.timestamp + 1), bytes32(0));
     }
 
     // ─── Expiry ────────────────────────────────────────────────────────────────
@@ -142,7 +144,7 @@ contract KYCRegistryTest is BaseTest {
 
         vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
         vm.prank(attester);
-        registry.issueAttestation(charlie, true, false, "US", uint64(block.timestamp + 1), bytes32(0));
+        registry.issueAttestation(charlie, true, false, false, "US", uint64(block.timestamp + 1), bytes32(0));
     }
 
     // ─── Fuzz ──────────────────────────────────────────────────────────────────
@@ -156,12 +158,125 @@ contract KYCRegistryTest is BaseTest {
         vm.prank(attester);
         registry.issueAttestation(
             wallet,
-            false, true, "UA",
+            false, false, true, // regSEligible
+            "UA",
             uint64(block.timestamp + offsetDays),
             bytes32(0)
         );
 
         assertTrue(registry.isVerified(wallet));
         assertTrue(registry.isRegSEligible(wallet));
+    }
+
+    // ─── nonAccreditedUS ───────────────────────────────────────────────────────
+
+    function test_NonAccreditedUS_IsVerifiedAndEligible() public {
+        // dave is set up in BaseTest as US non-accredited
+        assertTrue(registry.isVerified(dave));
+        assertTrue(registry.isNonAccreditedUS(dave));
+        assertTrue(registry.isEligibleInvestor(dave));
+        assertFalse(registry.isAccredited(dave));
+        assertFalse(registry.isRegSEligible(dave));
+    }
+
+    function test_NonAccreditedUS_False_ForAccredited() public {
+        assertFalse(registry.isNonAccreditedUS(alice));
+    }
+
+    function test_NonAccreditedUS_False_ForRegS() public {
+        assertFalse(registry.isNonAccreditedUS(bob));
+    }
+
+    // ─── ConflictingInvestorTypes ──────────────────────────────────────────────
+
+    function test_RevertWhen_TwoTypesSet() public {
+        address wallet = makeAddr("dual");
+        vm.expectRevert(KYCRegistry.ConflictingInvestorTypes.selector);
+        vm.prank(attester);
+        // accredited + regS both true → conflict
+        registry.issueAttestation(wallet, true, false, true, "US", uint64(block.timestamp + 365 days), bytes32(0));
+    }
+
+    function test_RevertWhen_NoTypeSet() public {
+        address wallet = makeAddr("none");
+        vm.expectRevert(KYCRegistry.ConflictingInvestorTypes.selector);
+        vm.prank(attester);
+        // all false → typeCount = 0 → conflict
+        registry.issueAttestation(wallet, false, false, false, "UA", uint64(block.timestamp + 365 days), bytes32(0));
+    }
+
+    function test_RevertWhen_AllThreeTypesSet() public {
+        address wallet = makeAddr("all");
+        vm.expectRevert(KYCRegistry.ConflictingInvestorTypes.selector);
+        vm.prank(attester);
+        registry.issueAttestation(wallet, true, true, true, "US", uint64(block.timestamp + 365 days), bytes32(0));
+    }
+
+    // ─── Country restrictions ──────────────────────────────────────────────────
+
+    function test_US_RestrictedByDefault() public {
+        // Deploy a fresh registry — US restriction comes from constructor, before setUp's allowCountry
+        KYCRegistry freshRegistry = new KYCRegistry(admin, attester);
+        assertTrue(freshRegistry.isCountryRestricted(bytes2("US")));
+    }
+
+    function test_AllowCountry_RemovesRestriction() public {
+        // BaseTest setUp already called allowCountry("US"), so US should be unrestricted
+        assertFalse(registry.isCountryRestricted(bytes2("US")));
+    }
+
+    function test_RestrictCountry_AddsRestriction() public {
+        assertFalse(registry.isCountryRestricted(bytes2("CN")));
+        vm.prank(admin);
+        registry.restrictCountry(bytes2("CN"));
+        assertTrue(registry.isCountryRestricted(bytes2("CN")));
+    }
+
+    function test_RestrictCountry_EmitsEvent() public {
+        vm.expectEmit(true, false, false, false);
+        emit KYCRegistry.CountryRestricted(bytes2("CN"));
+        vm.prank(admin);
+        registry.restrictCountry(bytes2("CN"));
+    }
+
+    function test_AllowCountry_EmitsEvent() public {
+        vm.prank(admin);
+        registry.restrictCountry(bytes2("CN"));
+
+        vm.expectEmit(true, false, false, false);
+        emit KYCRegistry.CountryAllowed(bytes2("CN"));
+        vm.prank(admin);
+        registry.allowCountry(bytes2("CN"));
+    }
+
+    function test_GetCountry_ReturnsCorrectCode() public view {
+        assertEq(registry.getCountry(alice), bytes2("US"));
+        assertEq(registry.getCountry(bob),   bytes2("UA"));
+        assertEq(registry.getCountry(dave),  bytes2("US"));
+        assertEq(registry.getCountry(charlie), bytes2(0)); // no attestation
+    }
+
+    function test_RestrictCountry_OnlyAdmin() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                charlie,
+                registry.DEFAULT_ADMIN_ROLE()
+            )
+        );
+        vm.prank(charlie);
+        registry.restrictCountry(bytes2("UA"));
+    }
+
+    function test_AllowCountry_OnlyAdmin() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                charlie,
+                registry.DEFAULT_ADMIN_ROLE()
+            )
+        );
+        vm.prank(charlie);
+        registry.allowCountry(bytes2("US"));
     }
 }

@@ -41,13 +41,13 @@ contract PropertyFundingTest is BaseTest {
     }
 
     function test_Invest_TransitionsToFunded_WhenGoalReached() public {
-        // Fill the entire goal in one shot (alice is accredited, no cap restriction here)
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
+        // Bob (Reg S, no cap) fills the entire goal in one shot
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
 
         vm.expectEmit(true, true, false, false);
         emit PropertyFunding.StateChanged(PropertyFunding.State.FUNDRAISING, PropertyFunding.State.FUNDED);
 
-        vm.prank(alice);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
@@ -99,15 +99,15 @@ contract PropertyFundingTest is BaseTest {
     }
 
     function test_RevertWhen_InvestNotInFundraisingState() public {
-        // Fill goal to move to FUNDED
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        // Fill goal with bob (no cap) to move to FUNDED
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
 
         // Try investing again — should revert with wrong state
-        _fundInvestor(bob, address(funding), MIN_INVESTMENT);
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
         vm.expectRevert(
             abi.encodeWithSelector(
                 PropertyFunding.WrongState.selector,
@@ -115,7 +115,7 @@ contract PropertyFundingTest is BaseTest {
                 PropertyFunding.State.FUNDED
             )
         );
-        vm.prank(bob);
+        vm.prank(alice);
         funding.invest(MIN_INVESTMENT);
     }
 
@@ -145,12 +145,45 @@ contract PropertyFundingTest is BaseTest {
             PropertyFunding.State.REFUNDING
         );
 
-        funding.triggerRefund(); // anyone can call this
+        vm.prank(alice);
+        funding.triggerRefund();
+        assertEq(uint8(funding.state()), uint8(PropertyFunding.State.REFUNDING));
+    }
+
+    function test_TriggerRefund_OnlyInvestor_NonInvestorReverts() public {
+        // charlie has no KYC and no investment — must be rejected with NotAnInvestor
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT);
+
+        vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+
+        vm.expectRevert(PropertyFunding.NotAnInvestor.selector);
+        vm.prank(charlie); // charlie never called invest()
+        funding.triggerRefund();
+    }
+
+    function test_TriggerRefund_OnlyInvestor_InvestorSucceeds() public {
+        // alice invested → she can trigger the refund after deadline
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT);
+
+        vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+
+        vm.prank(alice);
+        funding.triggerRefund();
+
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.REFUNDING));
     }
 
     function test_RevertWhen_TriggerRefund_DeadlineNotReached() public {
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT);
+
         vm.expectRevert(PropertyFunding.DeadlineNotReached.selector);
+        vm.prank(alice);
         funding.triggerRefund();
     }
 
@@ -158,8 +191,9 @@ contract PropertyFundingTest is BaseTest {
         // Once the goal is met invest() transitions state to FUNDED immediately.
         // triggerRefund() requires FUNDRAISING, so it reverts with WrongState — not GoalAlreadyMet.
         // GoalAlreadyMet is a defensive guard; WrongState fires first via the modifier.
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        // bob is Reg S (no cap) — can invest the full FUNDING_GOAL
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
@@ -183,6 +217,7 @@ contract PropertyFundingTest is BaseTest {
         funding.invest(MIN_INVESTMENT);
 
         vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        vm.prank(alice);
         funding.triggerRefund();
 
         uint256 usdcBefore = usdc.balanceOf(alice);
@@ -204,6 +239,7 @@ contract PropertyFundingTest is BaseTest {
         funding.invest(MIN_INVESTMENT);
 
         vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        vm.prank(alice);
         funding.triggerRefund();
 
         vm.expectRevert(PropertyFunding.NothingToRefund.selector);
@@ -217,6 +253,7 @@ contract PropertyFundingTest is BaseTest {
         funding.invest(MIN_INVESTMENT);
 
         vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        vm.prank(alice);
         funding.triggerRefund();
 
         vm.prank(alice);
@@ -231,8 +268,8 @@ contract PropertyFundingTest is BaseTest {
     // ─── withdrawFunds() ──────────────────────────────────────────────────────
 
     function test_WithdrawFunds_TransfersToMultisig() public {
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         uint256 multisigBefore = usdc.balanceOf(multisig);
@@ -249,8 +286,8 @@ contract PropertyFundingTest is BaseTest {
     }
 
     function test_RevertWhen_NonAdminWithdraws() public {
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         vm.expectRevert(
@@ -271,8 +308,9 @@ contract PropertyFundingTest is BaseTest {
      */
     function test_FullLifecycle_SuccessPath() public {
         // 1. Two investors fund the project
-        uint256 aliceAmount = 120_000e6;
-        uint256 bobAmount   =  80_000e6;
+        //    Alice (accredited, $25k cap) + Bob (Reg S, no cap) together hit $200k goal
+        uint256 aliceAmount =  25_000e6;
+        uint256 bobAmount   = 175_000e6;
         _fundInvestor(alice, address(funding), aliceAmount);
         _fundInvestor(bob,   address(funding), bobAmount);
 
@@ -304,8 +342,8 @@ contract PropertyFundingTest is BaseTest {
     // ─── Fuzz ──────────────────────────────────────────────────────────────────
 
     function testFuzz_Invest_AnyAmountAboveMin(uint256 amount) public {
-        // Bound: between min and funding goal
-        amount = bound(amount, MIN_INVESTMENT, FUNDING_GOAL);
+        // Bound alice's amount within her $25k accredited cap
+        amount = bound(amount, MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT);
         _fundInvestor(alice, address(funding), amount);
 
         vm.prank(alice);
@@ -319,7 +357,8 @@ contract PropertyFundingTest is BaseTest {
         uint256 amount1,
         uint256 amount2
     ) public {
-        amount1 = bound(amount1, MIN_INVESTMENT, FUNDING_GOAL / 2);
+        // alice capped at $25k, bob (Reg S) capped at half-goal for this test
+        amount1 = bound(amount1, MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT);
         amount2 = bound(amount2, MIN_INVESTMENT, FUNDING_GOAL / 2);
 
         _fundInvestor(alice, address(funding), amount1);
@@ -329,5 +368,159 @@ contract PropertyFundingTest is BaseTest {
         vm.prank(bob);   funding.invest(amount2);
 
         assertLe(funding.totalRaised(), FUNDING_GOAL + amount1 + amount2);
+    }
+
+    // ─── Per-investor-type limits ──────────────────────────────────────────────
+
+    function test_RevertWhen_AccreditedExceedsPerProjectLimit() public {
+        uint256 overLimit = MAX_ACCREDITED_INVESTMENT + 1;
+        _fundInvestor(alice, address(funding), overLimit);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.ExceedsInvestorLimit.selector,
+                MAX_ACCREDITED_INVESTMENT,
+                overLimit
+            )
+        );
+        vm.prank(alice);
+        funding.invest(overLimit);
+    }
+
+    function test_AccreditedMultipleInvests_CumulativeWithinLimit() public {
+        // Two investments totalling exactly the cap — both should succeed
+        uint256 half = MAX_ACCREDITED_INVESTMENT / 2;
+        _fundInvestor(alice, address(funding), MAX_ACCREDITED_INVESTMENT);
+
+        vm.prank(alice); funding.invest(half);
+        vm.prank(alice); funding.invest(half);
+
+        assertEq(funding.investments(alice), MAX_ACCREDITED_INVESTMENT);
+    }
+
+    function test_AccreditedMultipleInvests_CumulativeExceedsLimit() public {
+        // First invest fine, second pushes over the cap
+        _fundInvestor(alice, address(funding), MAX_ACCREDITED_INVESTMENT + MIN_INVESTMENT);
+
+        vm.prank(alice);
+        funding.invest(MAX_ACCREDITED_INVESTMENT); // fine — exactly at cap
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.ExceedsInvestorLimit.selector,
+                MAX_ACCREDITED_INVESTMENT,
+                MAX_ACCREDITED_INVESTMENT + MIN_INVESTMENT
+            )
+        );
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT); // pushes total over cap
+    }
+
+    function test_RevertWhen_NonAccreditedUS_ExceedsLimit() public {
+        uint256 overLimit = MAX_NON_ACCREDITED_INVESTMENT + 1;
+        _fundInvestor(dave, address(funding), overLimit);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.ExceedsInvestorLimit.selector,
+                MAX_NON_ACCREDITED_INVESTMENT,
+                overLimit
+            )
+        );
+        vm.prank(dave);
+        funding.invest(overLimit);
+    }
+
+    function test_RegS_NoLimit_CanInvestFullGoal() public {
+        // Bob (Reg S) has no per-project cap — can invest the entire funding goal
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
+        funding.invest(FUNDING_GOAL);
+
+        assertEq(funding.investments(bob), FUNDING_GOAL);
+        assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
+    }
+
+    // ─── Country restriction ───────────────────────────────────────────────────
+
+    function test_RevertWhen_InvestFromRestrictedCountry() public {
+        // Re-restrict US (setUp called allowCountry — undo that for this test)
+        vm.prank(admin);
+        registry.restrictCountry(bytes2("US"));
+
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.RestrictedCountry.selector,
+                alice,
+                bytes2("US")
+            )
+        );
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT);
+    }
+
+    function test_AllowCountry_UnblocksInvestment() public {
+        // Re-restrict, then allow, then invest succeeds
+        vm.prank(admin);
+        registry.restrictCountry(bytes2("US"));
+
+        vm.prank(admin);
+        registry.allowCountry(bytes2("US"));
+
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT); // no revert
+
+        assertEq(funding.investments(alice), MIN_INVESTMENT);
+    }
+
+    // ─── Append-only metadata ─────────────────────────────────────────────────
+
+    function test_OfferingDocHash_SetAtDeploy() public view {
+        assertEq(funding.offeringDocHash(), "ipfs://QmTestHash");
+    }
+
+    function test_LatestMetadata_ReturnsOfferingHash_WhenNoUpdates() public view {
+        assertEq(funding.latestMetadata(), "ipfs://QmTestHash");
+    }
+
+    function test_PushMetadataUpdate_AppendsToHistory() public {
+        vm.prank(admin);
+        funding.pushMetadataUpdate("ipfs://QmUpdate1");
+
+        string[] memory history = funding.getMetadataHistory();
+        assertEq(history.length, 1);
+        assertEq(history[0], "ipfs://QmUpdate1");
+        assertEq(funding.latestMetadata(), "ipfs://QmUpdate1");
+    }
+
+    function test_GetMetadataHistory_MultipleUpdates() public {
+        vm.startPrank(admin);
+        funding.pushMetadataUpdate("ipfs://QmUpdate1");
+        funding.pushMetadataUpdate("ipfs://QmUpdate2");
+        funding.pushMetadataUpdate("ipfs://QmUpdate3");
+        vm.stopPrank();
+
+        string[] memory history = funding.getMetadataHistory();
+        assertEq(history.length, 3);
+        assertEq(history[0], "ipfs://QmUpdate1");
+        assertEq(history[2], "ipfs://QmUpdate3");
+        assertEq(funding.latestMetadata(), "ipfs://QmUpdate3");
+        // Original doc hash is unchanged
+        assertEq(funding.offeringDocHash(), "ipfs://QmTestHash");
+    }
+
+    function test_PushMetadataUpdate_OnlyAdmin() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                alice,
+                funding.ADMIN_ROLE()
+            )
+        );
+        vm.prank(alice);
+        funding.pushMetadataUpdate("ipfs://evil");
     }
 }
