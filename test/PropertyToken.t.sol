@@ -17,8 +17,7 @@ contract PropertyTokenTest is BaseTest {
             "PropToken LA-01",
             "PROP-LA-01",
             admin,
-            minter,
-            address(registry)
+            minter
         );
     }
 
@@ -63,81 +62,29 @@ contract PropertyTokenTest is BaseTest {
         token.mint(alice, 1e18);
     }
 
-    // ─── ERC-3643 Transfer compliance ─────────────────────────────────────────
+    // ─── Non-transferable ─────────────────────────────────────────────────────
 
-    function test_Transfer_RevertWhen_TransfersNotEnabled() public {
+    /// @dev Any wallet-to-wallet transfer is permanently disabled, regardless of recipient KYC
+    function test_Transfer_AlwaysReverts() public {
         vm.prank(minter);
         token.mint(alice, 1_000e18);
 
-        vm.expectRevert(PropertyToken.TransfersLocked.selector);
+        vm.expectRevert(PropertyToken.TransfersDisabled.selector);
         vm.prank(alice);
         token.transfer(bob, 100e18);
     }
 
-    function test_Transfer_RevertWhen_RecipientNotKYC() public {
-        // Enable transfers first
-        vm.prank(admin);
-        token.enableTransfers();
-
+    /// @dev transferFrom is also permanently blocked
+    function test_TransferFrom_AlwaysReverts() public {
         vm.prank(minter);
         token.mint(alice, 1_000e18);
 
-        // charlie has no KYC — transfer should revert
-        vm.expectRevert(
-            abi.encodeWithSelector(PropertyToken.RecipientNotVerified.selector, charlie)
-        );
         vm.prank(alice);
-        token.transfer(charlie, 100e18);
-    }
+        token.approve(charlie, 100e18);
 
-    function test_Transfer_SucceedsWhen_EnabledAndRecipientKYC() public {
-        vm.prank(admin);
-        token.enableTransfers();
-
-        vm.prank(minter);
-        token.mint(alice, 1_000e18);
-
-        // alice → bob (both KYC'd)
-        vm.prank(alice);
-        token.transfer(bob, 300e18);
-
-        assertEq(token.balanceOf(alice), 700e18);
-        assertEq(token.balanceOf(bob),   300e18);
-    }
-
-    function test_EnableTransfers_EmitsEvent() public {
-        vm.expectEmit(false, false, false, false);
-        emit PropertyToken.TransfersEnabled();
-
-        vm.prank(admin);
-        token.enableTransfers();
-    }
-
-    // ─── Pause ────────────────────────────────────────────────────────────────
-
-    function test_Pause_BlocksTransferBetweenKYCWallets() public {
-        vm.prank(admin);
-        token.enableTransfers();
-
-        vm.prank(minter);
-        token.mint(alice, 1_000e18);
-
-        vm.prank(admin);
-        token.pause();
-
-        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
-        vm.prank(alice);
-        token.transfer(bob, 100e18);
-    }
-
-    function test_Pause_DoesNotBlockMintBurn() public {
-        vm.prank(admin);
-        token.pause();
-
-        // Mint still works (mint bypasses the pause check in _update)
-        vm.prank(minter);
-        token.mint(alice, 500e18);
-        assertEq(token.balanceOf(alice), 500e18);
+        vm.expectRevert(PropertyToken.TransfersDisabled.selector);
+        vm.prank(charlie);
+        token.transferFrom(alice, bob, 100e18);
     }
 
     // ─── Fuzz ──────────────────────────────────────────────────────────────────

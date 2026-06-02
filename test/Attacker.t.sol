@@ -68,7 +68,7 @@ contract AttackerTest is BaseTest {
             "LongProject", "LONG", multisig,
             FUNDING_GOAL, block.timestamp + 730 days,
             ROI_BPS, block.timestamp + 800 days, block.timestamp + 1000 days,
-            MIN_INVESTMENT, "ipfs://long"
+            MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT, MAX_NON_ACCREDITED_INVESTMENT, "ipfs://long"
         );
         PropertyFunding longFunding = PropertyFunding(longF);
 
@@ -113,7 +113,7 @@ contract AttackerTest is BaseTest {
         );
         vm.prank(charlie);
         registry.issueAttestation(
-            charlie, true, false, "US",
+            charlie, true, false, false, "US",
             uint64(block.timestamp + 365 days),
             bytes32(0)
         );
@@ -135,7 +135,62 @@ contract AttackerTest is BaseTest {
             )
         );
         vm.prank(charlie);
-        registry.issueAttestation(victim, true, false, "US", uint64(block.timestamp + 1), bytes32(0));
+        registry.issueAttestation(victim, true, false, false, "US", uint64(block.timestamp + 1), bytes32(0));
+    }
+
+    /// @dev US accredited investor tries to exceed the $25k per-project cap in one tx
+    function test_Attack_ExceedAccreditedInvestorLimit() public {
+        uint256 overCap = MAX_ACCREDITED_INVESTMENT + 1e6; // $26k
+        _fundInvestor(alice, address(funding), overCap);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.ExceedsInvestorLimit.selector,
+                MAX_ACCREDITED_INVESTMENT,
+                overCap
+            )
+        );
+        vm.prank(alice);
+        funding.invest(overCap);
+
+        assertEq(funding.totalRaised(), 0);
+    }
+
+    /// @dev US non-accredited investor tries to exceed the $2.5k per-project cap
+    function test_Attack_ExceedNonAccreditedUSLimit() public {
+        uint256 overCap = MAX_NON_ACCREDITED_INVESTMENT + 1e6; // $3.5k
+        _fundInvestor(dave, address(funding), overCap);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.ExceedsInvestorLimit.selector,
+                MAX_NON_ACCREDITED_INVESTMENT,
+                overCap
+            )
+        );
+        vm.prank(dave);
+        funding.invest(overCap);
+
+        assertEq(funding.totalRaised(), 0);
+    }
+
+    /// @dev US investor tries to invest after admin restricts the US country code
+    function test_Attack_InvestFromRestrictedCountry() public {
+        vm.prank(admin);
+        registry.restrictCountry(bytes2("US"));
+
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.RestrictedCountry.selector,
+                alice,
+                bytes2("US")
+            )
+        );
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT);
+
+        assertEq(funding.totalRaised(), 0);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -219,21 +274,6 @@ contract AttackerTest is BaseTest {
         assertEq(token.balanceOf(alice), aliceBalance);
     }
 
-    /// @dev Attacker tries to enable secondary-market transfers without admin role
-    function test_Attack_EnableTransfersWithoutRole() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector,
-                charlie,
-                token.DEFAULT_ADMIN_ROLE()
-            )
-        );
-        vm.prank(charlie);
-        token.enableTransfers();
-
-        assertFalse(token.transfersEnabled());
-    }
-
     /// @dev Attacker tries to pause the funding contract (denial of service)
     function test_Attack_PauseFundingWithoutRole() public {
         vm.expectRevert(
@@ -255,8 +295,8 @@ contract AttackerTest is BaseTest {
 
     /// @dev Attacker (or investor) tries to withdraw funds — admin only
     function test_Attack_WithdrawFundsAsInvestor() public {
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         vm.expectRevert(
@@ -324,6 +364,7 @@ contract AttackerTest is BaseTest {
         funding.invest(MIN_INVESTMENT);
 
         vm.expectRevert(PropertyFunding.DeadlineNotReached.selector);
+        vm.prank(alice);
         funding.triggerRefund(); // deadline is 30 days away
     }
 
@@ -359,8 +400,8 @@ contract AttackerTest is BaseTest {
     /// @dev Attacker tries to run triggerRefund on a successfully FUNDED project
     ///      (goal was met → state moved to FUNDED → triggerRefund requires FUNDRAISING)
     function test_Attack_TriggerRefundAfterGoalMet() public {
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
@@ -387,6 +428,7 @@ contract AttackerTest is BaseTest {
         funding.invest(MIN_INVESTMENT);
 
         vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        vm.prank(alice);
         funding.triggerRefund();
 
         vm.prank(alice);
@@ -403,9 +445,9 @@ contract AttackerTest is BaseTest {
 
     /// @dev Attacker tries to claim ROI distribution twice
     function test_Attack_DoubleROIClaim() public {
-        // Full lifecycle → COMPLETED
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        // Full lifecycle → COMPLETED (bob is Reg S — no cap)
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
         vm.startPrank(admin);
         funding.withdrawFunds();
@@ -413,33 +455,34 @@ contract AttackerTest is BaseTest {
         funding.setCompleted();
         vm.stopPrank();
 
-        uint256 aliceClaim = FUNDING_GOAL + (FUNDING_GOAL * ROI_BPS / 10_000);
+        uint256 bobClaim = FUNDING_GOAL + (FUNDING_GOAL * ROI_BPS / 10_000);
         (bytes32 root, bytes32[] memory proof,) = _buildMerkleTree(
-            alice, aliceClaim,
-            bob, 1e6 // dummy second leaf to build valid tree
+            bob, bobClaim,
+            alice, 1e6 // dummy second leaf to build valid tree
         );
-        usdc.mint(admin, aliceClaim + 1e6);
+        usdc.mint(admin, bobClaim + 1e6);
         vm.startPrank(admin);
-        usdc.approve(address(distributor), aliceClaim + 1e6);
-        distributor.depositReturns(address(funding), root, aliceClaim + 1e6);
+        usdc.approve(address(distributor), bobClaim + 1e6);
+        distributor.depositReturns(address(funding), root, bobClaim + 1e6);
         vm.stopPrank();
 
-        vm.prank(alice);
-        distributor.claim(address(funding), aliceClaim, proof); // legitimate
+        vm.prank(bob);
+        distributor.claim(address(funding), bobClaim, proof); // legitimate
 
         // Second attempt
         vm.expectRevert(ROIDistributor.AlreadyClaimed.selector);
-        vm.prank(alice);
-        distributor.claim(address(funding), aliceClaim, proof);
+        vm.prank(bob);
+        distributor.claim(address(funding), bobClaim, proof);
 
-        // Alice got exactly principal + ROI, nothing extra
-        assertEq(usdc.balanceOf(alice), aliceClaim);
+        // Bob got exactly principal + ROI, nothing extra
+        assertEq(usdc.balanceOf(bob), bobClaim);
     }
 
     /// @dev Attacker who has no investment tries to claim ROI
     function test_Attack_ClaimROIWithNoInvestment() public {
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        // bob is Reg S — no cap; invest full goal
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
         vm.startPrank(admin);
         funding.withdrawFunds();
@@ -447,19 +490,19 @@ contract AttackerTest is BaseTest {
         funding.setCompleted();
         vm.stopPrank();
 
-        uint256 aliceClaim = FUNDING_GOAL + (FUNDING_GOAL * ROI_BPS / 10_000);
-        (bytes32 root, bytes32[] memory aliceProof,) = _buildMerkleTree(alice, aliceClaim, bob, 1e6);
+        uint256 bobClaim = FUNDING_GOAL + (FUNDING_GOAL * ROI_BPS / 10_000);
+        (bytes32 root, bytes32[] memory bobProof,) = _buildMerkleTree(bob, bobClaim, alice, 1e6);
 
-        usdc.mint(admin, aliceClaim + 1e6);
+        usdc.mint(admin, bobClaim + 1e6);
         vm.startPrank(admin);
-        usdc.approve(address(distributor), aliceClaim + 1e6);
-        distributor.depositReturns(address(funding), root, aliceClaim + 1e6);
+        usdc.approve(address(distributor), bobClaim + 1e6);
+        distributor.depositReturns(address(funding), root, bobClaim + 1e6);
         vm.stopPrank();
 
         // charlie has no investment — no leaf in the tree → invalid proof
         vm.expectRevert(ROIDistributor.InvalidProof.selector);
         vm.prank(charlie);
-        distributor.claim(address(funding), aliceClaim, aliceProof);
+        distributor.claim(address(funding), bobClaim, bobProof);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -472,7 +515,7 @@ contract AttackerTest is BaseTest {
         (bytes32 root, bytes32[] memory aliceProof, bytes32[] memory bobProof) = _buildPayoutTree();
         _depositDistribution(root);
 
-        uint256 aliceReal  = 120_000e6 + (120_000e6 * ROI_BPS / 10_000);
+        uint256 aliceReal  = 25_000e6 + (25_000e6 * ROI_BPS / 10_000);
         uint256 aliceFaked = aliceReal + 50_000e6; // attacker tries to steal extra
 
         vm.expectRevert(ROIDistributor.InvalidProof.selector);
@@ -489,7 +532,7 @@ contract AttackerTest is BaseTest {
         (bytes32 root,, bytes32[] memory bobProof) = _buildPayoutTree();
         _depositDistribution(root);
 
-        uint256 bobClaim = 80_000e6 + (80_000e6 * ROI_BPS / 10_000);
+        uint256 bobClaim = 175_000e6 + (175_000e6 * ROI_BPS / 10_000);
 
         // charlie uses bob's proof + bob's amount — leaf = keccak256(charlie, bobClaim)
         // which doesn't match the tree leaf keccak256(bob, bobClaim) → invalid
@@ -504,7 +547,7 @@ contract AttackerTest is BaseTest {
         (bytes32 root,,) = _buildPayoutTree();
         _depositDistribution(root);
 
-        uint256 aliceClaim = 120_000e6 + (120_000e6 * ROI_BPS / 10_000);
+        uint256 aliceClaim = 25_000e6 + (25_000e6 * ROI_BPS / 10_000);
         bytes32[] memory emptyProof = new bytes32[](0);
 
         vm.expectRevert(ROIDistributor.InvalidProof.selector);
@@ -514,8 +557,8 @@ contract AttackerTest is BaseTest {
 
     /// @dev Attacker deposits returns for a non-completed project to poison the distributor
     function test_Attack_DepositReturnForActiveProject() public {
-        _fundInvestor(alice, address(funding), FUNDING_GOAL);
-        vm.prank(alice);
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
         funding.invest(FUNDING_GOAL);
         vm.startPrank(admin);
         funding.withdrawFunds();
@@ -557,6 +600,7 @@ contract AttackerTest is BaseTest {
         PropertyFundingFactory factory2 = new PropertyFundingFactory(
             admin, address(malUsdc), address(registry), address(dist2)
         );
+        dist2.setFactory(address(factory2));
         (address f2Addr,) = factory2.createProject(
             "ReentrancyProp", "REENT",
             multisig,
@@ -566,6 +610,8 @@ contract AttackerTest is BaseTest {
             block.timestamp + 60 days,
             block.timestamp + 540 days,
             MIN_INVESTMENT,
+            MAX_ACCREDITED_INVESTMENT,
+            MAX_NON_ACCREDITED_INVESTMENT,
             "ipfs://test"
         );
         vm.stopPrank();
@@ -581,6 +627,7 @@ contract AttackerTest is BaseTest {
 
         // Trigger refund
         vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        vm.prank(alice);
         f2.triggerRefund();
 
         // Arm the reentrancy attack — MaliciousUSDC will call f2.claimRefund() inside transfer
@@ -617,6 +664,7 @@ contract AttackerTest is BaseTest {
         funding.invest(MIN_INVESTMENT);
 
         vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        vm.prank(alice);
         funding.triggerRefund();
 
         vm.prank(alice);
@@ -700,29 +748,19 @@ contract AttackerTest is BaseTest {
         registry.updateExpiry(ghost, uint64(block.timestamp + 365 days));
     }
 
-    /// @dev Attacker deploys a contract, issues itself KYC via the attester,
-    ///      transfers tokens to a non-KYC wallet when transfers are locked.
-    ///      Even if transfers were enabled, non-KYC recipients are rejected.
-    function test_Attack_TransferTokensToNonKYCWallet() public {
-        vm.prank(admin);
-        token.enableTransfers();
-
-        // Mint to alice
+    /// @dev Tokens are permanently non-transferable — any transfer attempt is rejected,
+    ///      even between two KYC'd wallets.
+    function test_Attack_TransferTokens() public {
         _fundInvestor(alice, address(funding), MIN_INVESTMENT);
         vm.prank(alice);
         funding.invest(MIN_INVESTMENT);
 
-        // Pre-store balance before setting up prank — same vm.prank/balanceOf gotcha
-        // as in test_Attack_BurnVictimsTokens: view calls consume the prank.
         uint256 aliceBalance = token.balanceOf(alice);
         assertGt(aliceBalance, 0);
 
-        // Alice tries to send to charlie (no KYC) — blocked by _update() compliance hook
-        vm.expectRevert(
-            abi.encodeWithSelector(PropertyToken.RecipientNotVerified.selector, charlie)
-        );
+        vm.expectRevert(PropertyToken.TransfersDisabled.selector);
         vm.prank(alice);
-        token.transfer(charlie, aliceBalance);
+        token.transfer(bob, aliceBalance); // bob is KYC'd — still rejected
     }
 
     /// @dev Boundary test: triggerRefund() at deadline - 1 second must revert.
@@ -743,6 +781,7 @@ contract AttackerTest is BaseTest {
         vm.warp(funding.deadline() - 1);
 
         vm.expectRevert(PropertyFunding.DeadlineNotReached.selector);
+        vm.prank(alice);
         funding.triggerRefund();
     }
 
@@ -756,6 +795,7 @@ contract AttackerTest is BaseTest {
 
         vm.warp(funding.deadline()); // at exactly deadline
 
+        vm.prank(alice);
         funding.triggerRefund(); // no revert expected — this is correct behaviour
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.REFUNDING));
     }
@@ -765,8 +805,8 @@ contract AttackerTest is BaseTest {
     // ══════════════════════════════════════════════════════════════════════════
 
     function _advanceToCompletedWithAliceAndBob() internal {
-        uint256 aliceAmt = 120_000e6;
-        uint256 bobAmt   =  80_000e6;
+        uint256 aliceAmt =  25_000e6; // US accredited — $25k cap
+        uint256 bobAmt   = 175_000e6; // Reg S — no cap; fills remainder to FUNDING_GOAL
         _fundInvestor(alice, address(funding), aliceAmt);
         _fundInvestor(bob,   address(funding), bobAmt);
         vm.prank(alice); funding.invest(aliceAmt);
@@ -783,14 +823,14 @@ contract AttackerTest is BaseTest {
         view
         returns (bytes32 root, bytes32[] memory aliceProof, bytes32[] memory bobProof)
     {
-        uint256 aliceClaim = 120_000e6 + (120_000e6 * ROI_BPS / 10_000);
-        uint256 bobClaim   =  80_000e6 + ( 80_000e6 * ROI_BPS / 10_000);
+        uint256 aliceClaim =  25_000e6 + ( 25_000e6 * ROI_BPS / 10_000); // $25k + 15% ROI
+        uint256 bobClaim   = 175_000e6 + (175_000e6 * ROI_BPS / 10_000); // $175k + 15% ROI
         (root, aliceProof, bobProof) = _buildMerkleTree(alice, aliceClaim, bob, bobClaim);
     }
 
     function _depositDistribution(bytes32 root) internal {
-        uint256 aliceClaim = 120_000e6 + (120_000e6 * ROI_BPS / 10_000);
-        uint256 bobClaim   =  80_000e6 + ( 80_000e6 * ROI_BPS / 10_000);
+        uint256 aliceClaim =  25_000e6 + ( 25_000e6 * ROI_BPS / 10_000);
+        uint256 bobClaim   = 175_000e6 + (175_000e6 * ROI_BPS / 10_000);
         uint256 total      = aliceClaim + bobClaim;
         usdc.mint(admin, total);
         vm.startPrank(admin);
