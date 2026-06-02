@@ -29,6 +29,7 @@ contract PropertyFundingFactory is AccessControl {
     address public immutable roiDistributor;
 
     address[] public projects; // list of all deployed PropertyFunding addresses
+    mapping(address => bool) public isProject; // factory-deployed projects only
 
     // ─── Events ────────────────────────────────────────────────────────────────
     event ProjectCreated(
@@ -69,18 +70,20 @@ contract PropertyFundingFactory is AccessControl {
 
     /**
      * @notice Create a new property investment project.
-     * @param tokenName            ERC-20 name, e.g. "PropToken LA-2024-01"
-     * @param tokenSymbol          ERC-20 symbol, e.g. "PROP-LA-01"
-     * @param withdrawalRecipient  Gnosis Safe that receives raised USDC
-     * @param fundingGoal          Target in USDC (6 decimals), e.g. 200_000e6
-     * @param deadline             Unix timestamp — fundraising deadline
-     * @param expectedROIBps       Expected return in basis points, e.g. 1500 = 15%
-     * @param estimatedStartDate   Expected construction start (unix)
-     * @param estimatedEndDate     Expected construction end (unix)
-     * @param minInvestment        Minimum USDC per investment tx, e.g. 2_000e6
-     * @param metadataURI          IPFS CID with property details, images, legal docs
-     * @return fundingContract     Deployed PropertyFunding address
-     * @return tokenContract       Deployed PropertyToken address
+     * @param tokenName                    ERC-20 name, e.g. "PropToken LA-2024-01"
+     * @param tokenSymbol                  ERC-20 symbol, e.g. "PROP-LA-01"
+     * @param withdrawalRecipient          Gnosis Safe that receives raised USDC
+     * @param fundingGoal                  Target in USDC (6 decimals), e.g. 200_000e6
+     * @param deadline                     Unix timestamp — fundraising deadline
+     * @param expectedROIBps               Expected return in basis points, e.g. 1500 = 15%
+     * @param estimatedStartDate           Expected construction start (unix)
+     * @param estimatedEndDate             Expected construction end (unix)
+     * @param minInvestment                Minimum USDC per investment tx, e.g. 2_000e6
+     * @param maxAccreditedInvestment      Reg D 506(c) cumulative cap per investor, e.g. 25_000e6
+     * @param maxNonAccreditedUSInvestment Reg D 506(b) cumulative cap per investor, e.g. 2_500e6
+     * @param offeringDocHash              IPFS CID of the legal offering documents — permanent, never changes
+     * @return fundingContract             Deployed PropertyFunding address
+     * @return tokenContract               Deployed PropertyToken address
      */
     function createProject(
         string  calldata tokenName,
@@ -92,19 +95,25 @@ contract PropertyFundingFactory is AccessControl {
         uint256          estimatedStartDate,
         uint256          estimatedEndDate,
         uint256          minInvestment,
-        string  calldata metadataURI
+        uint256          maxAccreditedInvestment,
+        uint256          maxNonAccreditedUSInvestment,
+        string  calldata offeringDocHash
     ) external onlyRole(ADMIN_ROLE) returns (address fundingContract, address tokenContract) {
         if (withdrawalRecipient == address(0)) revert ZeroAddress();
-        if (fundingGoal == 0 || minInvestment == 0 || deadline <= block.timestamp)
-            revert InvalidParam();
+        if (
+            fundingGoal == 0 ||
+            minInvestment == 0 ||
+            maxAccreditedInvestment == 0 ||
+            maxNonAccreditedUSInvestment == 0 ||
+            deadline <= block.timestamp
+        ) revert InvalidParam();
 
         // 1. Deploy PropertyToken — factory holds temp MINTER_ROLE (address(this))
         PropertyToken token = new PropertyToken(
             tokenName,
             tokenSymbol,
-            msg.sender,   // admin = caller (Gnosis Safe)
-            address(this), // temp minter, revoked below
-            kycRegistry
+            msg.sender,    // admin = caller (Gnosis Safe)
+            address(this)  // temp minter, revoked below
         );
 
         // 2. Deploy PropertyFunding
@@ -120,7 +129,9 @@ contract PropertyFundingFactory is AccessControl {
             estimatedStartDate,
             estimatedEndDate,
             minInvestment,
-            metadataURI
+            maxAccreditedInvestment,
+            maxNonAccreditedUSInvestment,
+            offeringDocHash
         );
 
         // 3+4. Wire up MINTER_ROLE — funding contract mints on invest(), burns on refund()
@@ -135,6 +146,7 @@ contract PropertyFundingFactory is AccessControl {
         token.revokeRole(DEFAULT_ADMIN_ROLE, address(this));
 
         projects.push(address(funding));
+        isProject[address(funding)] = true;
         fundingContract = address(funding);
         tokenContract   = address(token);
 

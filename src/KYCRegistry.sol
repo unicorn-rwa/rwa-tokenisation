@@ -28,19 +28,21 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
     error ZeroAddress();
     error AlreadyRevoked();
     error AttestationNotFound();
+    error ConflictingInvestorTypes();
 
     // ─── Events ────────────────────────────────────────────────────────────────
     event AttestationIssued(
         address indexed wallet,
         bool accredited,
+        bool nonAccreditedUS,
         bool regS,
         bytes2 country,
         uint64 expiresAt
     );
-
-    // ─── storage slots (yes, vars on same time:))  ────────────────────────────────────────────────────────────────
     event AttestationRevoked(address indexed wallet);
     event AttestationUpdated(address indexed wallet, uint64 newExpiry);
+    event CountryRestricted(bytes2 indexed country);
+    event CountryAllowed(bytes2 indexed country);
 
 
     bytes32 public constant ATTESTER_ROLE = keccak256("ATTESTER_ROLE");
@@ -48,8 +50,9 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
 
     struct Attestation {
         bool    kycPassed;
-        bool    accreditedInvestor; // Reg D 506(c) — US accredited
-        bool    regSEligible;       // Reg S — non-US investor
+        bool    accreditedInvestor; // Reg D 506(c) — US accredited       (max $25k/project)
+        bool    nonAccreditedUS;    // Reg D 506(b) — US non-accredited   (max $2.5k/project)
+        bool    regSEligible;       // Reg S        — non-US investor      (country-level limits)
         bytes2  countryCode;        // ISO 3166-1 alpha-2, e.g. "US", "UA"
         uint64  expiresAt;          // unix timestamp — attestations expire (max 1 yr)
         bool    revoked;
@@ -61,24 +64,35 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
     // Written on OAuth callback, read on webhook to find which wallet to revoke
     mapping(bytes32 => address) private _pmIdHashToWallet;
 
+    // Countries blocked from investing (ISO 3166-1 alpha-2).
+    // KYC attestation can still be issued — restriction applies at invest() time only.
+    mapping(bytes2 => bool) private _restrictedCountries;
+
     // ─── Constructor ───────────────────────────────────────────────────────────
     constructor(address admin, address attester) {
         if (admin == address(0) || attester == address(0)) revert ZeroAddress();
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ATTESTER_ROLE, attester);
         _grantRole(PAUSER_ROLE, admin);
+
+        // V1: US investors not yet supported — restrict at investment level.
+        // Remove via allowCountry("US") when US investor flow is ready.
+        _restrictedCountries[bytes2("US")] = true;
+        emit CountryRestricted(bytes2("US"));
     }
 
     // ─── Attester actions ──────────────────────────────────────────────────────
 
     /**
      * @notice Issue or overwrite an attestation for a wallet.
+     *         Exactly one of accreditedInvestor / nonAccreditedUS / regSEligible must be true.
      * @param pmIdHash  keccak256(pmInvestorId) for webhook reverse-lookup.
      *                  Pass bytes32(0) for non-US (Synaps-only) investors.
      */
     function issueAttestation(
         address wallet,
         bool accreditedInvestor,
+        bool nonAccreditedUS,
         bool regSEligible,
         bytes2 countryCode,
         uint64 expiresAt,
@@ -86,9 +100,16 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
     ) external onlyRole(ATTESTER_ROLE) whenNotPaused {
         if (wallet == address(0)) revert ZeroAddress();
 
+        // Investor types are mutually exclusive — exactly one must be set
+        uint8 typeCount = (accreditedInvestor ? 1 : 0)
+                        + (nonAccreditedUS    ? 1 : 0)
+                        + (regSEligible       ? 1 : 0);
+        if (typeCount != 1) revert ConflictingInvestorTypes();
+
         _attestations[wallet] = Attestation({
             kycPassed:          true,
             accreditedInvestor: accreditedInvestor,
+            nonAccreditedUS:    nonAccreditedUS,
             regSEligible:       regSEligible,
             countryCode:        countryCode,
             expiresAt:          expiresAt,
@@ -99,7 +120,7 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
             _pmIdHashToWallet[pmIdHash] = wallet;
         }
 
-        emit AttestationIssued(wallet, accreditedInvestor, regSEligible, countryCode, expiresAt);
+        emit AttestationIssued(wallet, accreditedInvestor, nonAccreditedUS, regSEligible, countryCode, expiresAt);
     }
 
     /// @notice Revoke attestation — called on PM webhook (accreditation.expired/revoked)
@@ -129,20 +150,35 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
         return a.kycPassed && a.accreditedInvestor && !a.revoked && block.timestamp < a.expiresAt;
     }
 
+    function isNonAccreditedUS(address wallet) public view returns (bool) {
+        Attestation storage a = _attestations[wallet];
+        return a.kycPassed && a.nonAccreditedUS && !a.revoked && block.timestamp < a.expiresAt;
+    }
+
     function isRegSEligible(address wallet) public view returns (bool) {
         Attestation storage a = _attestations[wallet];
         return a.kycPassed && a.regSEligible && !a.revoked && block.timestamp < a.expiresAt;
     }
 
-    /// @notice True if investor is eligible under either Reg D (US) or Reg S (non-US)
+    /// @notice True if investor is eligible under Reg D 506(c), Reg D 506(b), or Reg S
     function isEligibleInvestor(address wallet) public view returns (bool) {
-        return isAccredited(wallet) || isRegSEligible(wallet);
+        return isAccredited(wallet) || isNonAccreditedUS(wallet) || isRegSEligible(wallet);
     }
 
     // ─── View helpers ──────────────────────────────────────────────────────────
 
     function getAttestation(address wallet) external view returns (Attestation memory) {
         return _attestations[wallet];
+    }
+
+    /// @notice Returns the country code stored for a wallet (bytes2(0) if no attestation).
+    function getCountry(address wallet) external view returns (bytes2) {
+        return _attestations[wallet].countryCode;
+    }
+
+    /// @notice True if the country is on the investment restriction list.
+    function isCountryRestricted(bytes2 countryCode) external view returns (bool) {
+        return _restrictedCountries[countryCode];
     }
 
     /// @notice Reverse-lookup for Parallel Markets webhook handling.
@@ -157,6 +193,20 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
     }
 
     // ─── Admin ─────────────────────────────────────────────────────────────────
+
+    /// @notice Add a country to the investment restriction list.
+    ///         Only the multisig (DEFAULT_ADMIN_ROLE) can call this.
+    function restrictCountry(bytes2 countryCode) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _restrictedCountries[countryCode] = true;
+        emit CountryRestricted(countryCode);
+    }
+
+    /// @notice Remove a country from the investment restriction list.
+    ///         Only the multisig (DEFAULT_ADMIN_ROLE) can call this.
+    function allowCountry(bytes2 countryCode) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _restrictedCountries[countryCode] = false;
+        emit CountryAllowed(countryCode);
+    }
 
     function pause()   external onlyRole(PAUSER_ROLE) { _pause(); }
     function unpause() external onlyRole(PAUSER_ROLE) { _unpause(); }

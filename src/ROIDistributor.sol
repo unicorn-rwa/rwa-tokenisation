@@ -8,6 +8,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {PropertyFunding} from "./PropertyFunding.sol";
 import {PropertyToken} from "./PropertyToken.sol";
+import {PropertyFundingFactory} from "./PropertyFundingFactory.sol";
 
 /**
  * @title ROIDistributor
@@ -32,6 +33,7 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
     IERC20 public immutable usdc;
+    PropertyFundingFactory public factory; // set once via setFactory() after deployment
 
     struct Distribution {
         bytes32 merkleRoot;
@@ -52,7 +54,10 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     // ─── Errors ────────────────────────────────────────────────────────────────
     error AlreadyClaimed();
     error InvalidProof();
+    error FactoryAlreadySet();
+    error FactoryNotSet();
     error ProjectNotCompleted();
+    error UnknownProject();
     error ZeroAddress();
     error ZeroAmount();
 
@@ -62,6 +67,13 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
         usdc = IERC20(usdc_);
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(ADMIN_ROLE, admin_);
+    }
+
+    /// @notice Wire up the factory after deployment. Can only be called once.
+    function setFactory(address factory_) external onlyRole(ADMIN_ROLE) {
+        if (address(factory) != address(0)) revert FactoryAlreadySet();
+        if (factory_ == address(0)) revert ZeroAddress();
+        factory = PropertyFundingFactory(factory_);
     }
 
     // ─── Admin ─────────────────────────────────────────────────────────────────
@@ -79,6 +91,8 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     ) external nonReentrant onlyRole(ADMIN_ROLE) {
         if (project == address(0)) revert ZeroAddress();
         if (totalAmount == 0) revert ZeroAmount();
+        if (address(factory) == address(0)) revert FactoryNotSet();
+        if (!factory.isProject(project)) revert UnknownProject();
 
         // Verify the project is in COMPLETED state before accepting funds
         if (PropertyFunding(project).state() != PropertyFunding.State.COMPLETED)

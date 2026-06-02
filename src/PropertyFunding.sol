@@ -64,14 +64,24 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     uint256        public immutable expectedROIBps;      // e.g. 1500 = 15%
     uint256        public immutable estimatedStartDate;
     uint256        public immutable estimatedEndDate;
-    uint256        public immutable minInvestment;       // USDC minimum per tx
+    uint256        public immutable minInvestment;            // USDC minimum per tx
+    uint256        public immutable maxAccreditedInvestment;   // Reg D 506(c) cap per investor (default 25_000e6)
+    uint256        public immutable maxNonAccreditedUSInvestment; // Reg D 506(b) cap per investor (default 2_500e6)
 
     // PropertyToken uses 18 decimals, USDC uses 6 → scale by 1e12
     uint256 public constant DECIMALS_FACTOR = 1e12;
 
+    // ─── Offering document (immutable) ────────────────────────────────────────
+    /// @notice Original IPFS CID of the legal offering documents, set at deploy.
+    ///         Never changes — protects investors from post-raise manipulation.
+    string public offeringDocHash;
+
     // ─── Mutable state ─────────────────────────────────────────────────────────
     uint256 public totalRaised;
-    string  public metadataURI; // IPFS CID — admin can update with new photos/docs
+
+    /// @notice Append-only update log: construction photos, progress reports, etc.
+    ///         Index 0 is the first post-deploy update. Use latestMetadata() for UI.
+    string[] private _metadataUpdates;
 
     mapping(address => uint256) public investments; // wallet → total USDC invested
     address[] private _investors;
@@ -82,7 +92,7 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     event RefundClaimed(address indexed investor, uint256 usdcAmount);
     event FundsWithdrawn(address indexed recipient, uint256 usdcAmount);
     event StateChanged(State indexed from, State indexed to);
-    event MetadataUpdated(string newURI);
+    event MetadataUpdatePushed(string cid, uint256 indexed index, uint256 timestamp);
 
     // ─── Errors ────────────────────────────────────────────────────────────────
     error WrongState(State required, State actual);
@@ -90,8 +100,11 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     error DeadlineNotReached();
     error GoalAlreadyMet();
     error BelowMinimum(uint256 min, uint256 provided);
+    error ExceedsInvestorLimit(uint256 limit, uint256 wouldBeTotal);
+    error RestrictedCountry(address investor, bytes2 country);
     error NotEligibleInvestor(address investor);
     error NothingToRefund();
+    error NotAnInvestor();
     error ZeroAddress();
     error InvalidParam();
 
@@ -114,7 +127,9 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
         uint256 estimatedStartDate_,
         uint256 estimatedEndDate_,
         uint256 minInvestment_,
-        string memory metadataURI_
+        uint256 maxAccreditedInvestment_,
+        uint256 maxNonAccreditedUSInvestment_,
+        string memory offeringDocHash_
     ) {
         if (
             usdc_ == address(0) ||
@@ -124,20 +139,27 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
             admin_ == address(0)
         ) revert ZeroAddress();
 
-        if (fundingGoal_ == 0 || minInvestment_ == 0 || deadline_ <= block.timestamp)
-            revert InvalidParam();
+        if (
+            fundingGoal_ == 0 ||
+            minInvestment_ == 0 ||
+            maxAccreditedInvestment_ == 0 ||
+            maxNonAccreditedUSInvestment_ == 0 ||
+            deadline_ <= block.timestamp
+        ) revert InvalidParam();
 
-        usdc               = IERC20(usdc_);
-        propertyToken      = PropertyToken(propertyToken_);
-        kycRegistry        = IKYCRegistry(kycRegistry_);
-        withdrawalRecipient = withdrawalRecipient_;
-        fundingGoal        = fundingGoal_;
-        deadline           = deadline_;
-        expectedROIBps     = expectedROIBps_;
-        estimatedStartDate = estimatedStartDate_;
-        estimatedEndDate   = estimatedEndDate_;
-        minInvestment      = minInvestment_;
-        metadataURI        = metadataURI_;
+        usdc                        = IERC20(usdc_);
+        propertyToken               = PropertyToken(propertyToken_);
+        kycRegistry                 = IKYCRegistry(kycRegistry_);
+        withdrawalRecipient         = withdrawalRecipient_;
+        fundingGoal                 = fundingGoal_;
+        deadline                    = deadline_;
+        expectedROIBps              = expectedROIBps_;
+        estimatedStartDate          = estimatedStartDate_;
+        estimatedEndDate            = estimatedEndDate_;
+        minInvestment               = minInvestment_;
+        maxAccreditedInvestment     = maxAccreditedInvestment_;
+        maxNonAccreditedUSInvestment = maxNonAccreditedUSInvestment_;
+        offeringDocHash             = offeringDocHash_;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(ADMIN_ROLE, admin_);
@@ -160,6 +182,20 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
         if (block.timestamp >= deadline) revert DeadlinePassed();
         if (usdcAmount < minInvestment) revert BelowMinimum(minInvestment, usdcAmount);
         if (!kycRegistry.isEligibleInvestor(msg.sender)) revert NotEligibleInvestor(msg.sender);
+
+        bytes2 country = kycRegistry.getCountry(msg.sender);
+        if (kycRegistry.isCountryRestricted(country)) revert RestrictedCountry(msg.sender, country);
+
+        // Enforce per-investor-type cumulative cap for this property
+        // Reg S (non-US) investors have no cap — only US tracks apply
+        uint256 newTotal = investments[msg.sender] + usdcAmount;
+        if (kycRegistry.isAccredited(msg.sender)) {
+            if (newTotal > maxAccreditedInvestment)
+                revert ExceedsInvestorLimit(maxAccreditedInvestment, newTotal);
+        } else if (kycRegistry.isNonAccreditedUS(msg.sender)) {
+            if (newTotal > maxNonAccreditedUSInvestment)
+                revert ExceedsInvestorLimit(maxNonAccreditedUSInvestment, newTotal);
+        }
 
         // Effects — update state before external calls (CEI pattern)
         investments[msg.sender] += usdcAmount;
@@ -256,15 +292,18 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
      *         and the goal was not met. Trustless — no admin required.
      */
     function triggerRefund() external onlyState(State.FUNDRAISING) {
-        if (block.timestamp < deadline)  revert DeadlineNotReached();
-        if (totalRaised >= fundingGoal)  revert GoalAlreadyMet();
+        if (investments[msg.sender] == 0) revert NotAnInvestor();
+        if (block.timestamp < deadline)   revert DeadlineNotReached();
+        if (totalRaised >= fundingGoal)   revert GoalAlreadyMet();
         _transitionTo(State.REFUNDING);
     }
 
-    /// @notice Admin updates IPFS metadata URI (construction photos, legal docs)
-    function updateMetadata(string calldata newURI) external onlyRole(ADMIN_ROLE) {
-        metadataURI = newURI;
-        emit MetadataUpdated(newURI);
+    /// @notice Push a new IPFS CID to the update log (construction photos, progress reports).
+    ///         Append-only — existing records cannot be edited or deleted.
+    ///         The original offeringDocHash is always preserved separately.
+    function pushMetadataUpdate(string calldata cid) external onlyRole(ADMIN_ROLE) {
+        _metadataUpdates.push(cid);
+        emit MetadataUpdatePushed(cid, _metadataUpdates.length - 1, block.timestamp);
     }
 
     // ─── View helpers ──────────────────────────────────────────────────────────
@@ -284,6 +323,18 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
 
     function isDeadlinePassed() external view returns (bool) {
         return block.timestamp >= deadline;
+    }
+
+    /// @notice Full append-only update history as an array of IPFS CIDs.
+    ///         UI can display this as a timeline alongside offeringDocHash.
+    function getMetadataHistory() external view returns (string[] memory) {
+        return _metadataUpdates;
+    }
+
+    /// @notice Latest metadata CID: most recent update, or offeringDocHash if no updates yet.
+    function latestMetadata() external view returns (string memory) {
+        if (_metadataUpdates.length == 0) return offeringDocHash;
+        return _metadataUpdates[_metadataUpdates.length - 1];
     }
 
     // ─── Internal ──────────────────────────────────────────────────────────────
