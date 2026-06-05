@@ -71,6 +71,17 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     // PropertyToken uses 18 decimals, USDC uses 6 → scale by 1e12
     uint256 public constant DECIMALS_FACTOR = 1e12;
 
+    // Maximum allowed fundraising window — prevents indefinite fund-locking
+    uint256 public constant MAX_FUNDRAISING_DURATION = 180 days;
+
+    // How long admin has to call withdrawFunds() after goal is met before
+    // investors can force a refund (H-1 escape hatch)
+    uint256 public constant WITHDRAWAL_TIMEOUT = 30 days;
+
+    // L-3: cap investor count so commitDistribution() gas stays within Base block limits
+    // (500 investors ≈ 20.5M gas on commitDistribution — 34% of Base block)
+    uint256 public constant MAX_INVESTORS = 500;
+
     // ─── Offering document (immutable) ────────────────────────────────────────
     /// @notice Original IPFS CID of the legal offering documents, set at deploy.
     ///         Never changes — protects investors from post-raise manipulation.
@@ -78,6 +89,7 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
 
     // ─── Mutable state ─────────────────────────────────────────────────────────
     uint256 public totalRaised;
+    uint256 public fundedAt; // timestamp when state → FUNDED; 0 until goal is met
 
     /// @notice Append-only update log: construction photos, progress reports, etc.
     ///         Index 0 is the first post-deploy update. Use latestMetadata() for UI.
@@ -98,6 +110,8 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     error WrongState(State required, State actual);
     error DeadlinePassed();
     error DeadlineNotReached();
+    error DeadlineTooFar();
+    error WithdrawalTimeoutNotReached();
     error GoalAlreadyMet();
     error BelowMinimum(uint256 min, uint256 provided);
     error ExceedsInvestorLimit(uint256 limit, uint256 wouldBeTotal);
@@ -107,6 +121,7 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     error NotAnInvestor();
     error ZeroAddress();
     error InvalidParam();
+    error TooManyInvestors();
 
     // ─── Modifiers ─────────────────────────────────────────────────────────────
     modifier onlyState(State required) {
@@ -146,6 +161,10 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
             maxNonAccreditedUSInvestment_ == 0 ||
             deadline_ <= block.timestamp
         ) revert InvalidParam();
+        if (deadline_ > block.timestamp + MAX_FUNDRAISING_DURATION) revert DeadlineTooFar();
+        // M-3: relational validation — min must not exceed per-investor caps
+        if (minInvestment_ > maxAccreditedInvestment_) revert InvalidParam();
+        if (minInvestment_ > maxNonAccreditedUSInvestment_) revert InvalidParam();
 
         usdc                        = IERC20(usdc_);
         propertyToken               = PropertyToken(propertyToken_);
@@ -202,6 +221,8 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
         totalRaised             += usdcAmount;
 
         if (!_isInvestor[msg.sender]) {
+            // L-3: cap investor count — prevents unbounded array growth / distributor gas DoS
+            if (_investors.length >= MAX_INVESTORS) revert TooManyInvestors();
             _investors.push(msg.sender);
             _isInvestor[msg.sender] = true;
         }
@@ -257,7 +278,9 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
         onlyRole(ADMIN_ROLE)
         onlyState(State.FUNDED)
     {
-        uint256 amount = usdc.balanceOf(address(this));
+        // M-4: use totalRaised (tracked amount) not balanceOf — prevents accidentally
+        //      sent USDC from being swept to the multisig
+        uint256 amount = totalRaised;
         _transitionTo(State.WITHDRAWN);
         usdc.safeTransfer(withdrawalRecipient, amount);
         emit FundsWithdrawn(withdrawalRecipient, amount);
@@ -288,13 +311,27 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @notice Anyone can trigger REFUNDING once the deadline has passed
-     *         and the goal was not met. Trustless — no admin required.
+     * @notice Trustless escape hatch — investors can force REFUNDING in two cases:
+     *
+     *   1. FUNDRAISING: deadline passed and goal was not met (original path).
+     *   2. FUNDED: goal was met but admin failed to call withdrawFunds() within
+     *              WITHDRAWAL_TIMEOUT (30 days). USDC is still in this contract,
+     *              so a full refund is possible.
+     *
+     * In both cases no admin action is required — any investor can call this.
      */
-    function triggerRefund() external onlyState(State.FUNDRAISING) {
+    function triggerRefund() external {
         if (investments[msg.sender] == 0) revert NotAnInvestor();
-        if (block.timestamp < deadline)   revert DeadlineNotReached();
-        if (totalRaised >= fundingGoal)   revert GoalAlreadyMet();
+
+        if (state == State.FUNDRAISING) {
+            if (block.timestamp < deadline) revert DeadlineNotReached();
+            if (totalRaised >= fundingGoal) revert GoalAlreadyMet();
+        } else if (state == State.FUNDED) {
+            if (block.timestamp <= fundedAt + WITHDRAWAL_TIMEOUT) revert WithdrawalTimeoutNotReached();
+        } else {
+            revert WrongState(State.FUNDRAISING, state);
+        }
+
         _transitionTo(State.REFUNDING);
     }
 
@@ -342,6 +379,7 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     function _transitionTo(State newState) internal {
         emit StateChanged(state, newState);
         state = newState;
+        if (newState == State.FUNDED) fundedAt = block.timestamp;
     }
 
     // ─── Emergency ─────────────────────────────────────────────────────────────

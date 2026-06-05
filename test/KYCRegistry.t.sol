@@ -128,6 +128,22 @@ contract KYCRegistryTest is BaseTest {
         vm.stopPrank();
     }
 
+    function test_RevertWhen_UpdateExpiry_OnRevokedAttestation() public {
+        // Alice is sanctioned — manually revoked by attester (e.g. OFAC hit)
+        vm.prank(attester);
+        registry.revokeAttestation(alice);
+
+        assertFalse(registry.isVerified(alice));
+
+        // Compromised attester (or buggy PM webhook) tries to restore her via updateExpiry
+        vm.expectRevert(KYCRegistry.AlreadyRevoked.selector);
+        vm.prank(attester);
+        registry.updateExpiry(alice, uint64(block.timestamp + 365 days));
+
+        // Revocation must still be in effect
+        assertFalse(registry.isVerified(alice));
+    }
+
     // ─── isEligibleInvestor ────────────────────────────────────────────────────
 
     function test_IsEligibleInvestor_TrueForBothTracks() public {
@@ -278,5 +294,57 @@ contract KYCRegistryTest is BaseTest {
         );
         vm.prank(charlie);
         registry.allowCountry(bytes2("US"));
+    }
+
+    // ─── M-1: no silent overwrite of active attestation ────────────────────────
+
+    function test_RevertWhen_IssueAttestation_OverActiveAttestation() public {
+        // alice already has an active attestation — re-issuing must revert
+        vm.expectRevert(KYCRegistry.AttestationAlreadyActive.selector);
+        vm.prank(attester);
+        registry.issueAttestation(alice, true, false, false, "US", uint64(block.timestamp + 365 days), bytes32(0));
+    }
+
+    function test_IssueAttestation_AllowsReissueAfterExpiry() public {
+        // warp past alice's attestation expiry — re-issue should succeed
+        vm.warp(block.timestamp + 366 days);
+        assertFalse(registry.isVerified(alice));
+
+        vm.prank(attester);
+        registry.issueAttestation(alice, true, false, false, "US", uint64(block.timestamp + 365 days), bytes32(0));
+
+        assertTrue(registry.isVerified(alice));
+    }
+
+    function test_IssueAttestation_AllowsReissueAfterRevoke() public {
+        vm.startPrank(attester);
+        registry.revokeAttestation(alice);
+        // revoked attestation is not active — re-issue should succeed
+        registry.issueAttestation(alice, true, false, false, "US", uint64(block.timestamp + 365 days), bytes32(0));
+        vm.stopPrank();
+
+        assertTrue(registry.isVerified(alice));
+    }
+
+    function test_RevertWhen_IssueAttestation_PastExpiry() public {
+        // expiresAt in the past — would silently issue an already-expired attestation
+        vm.expectRevert(KYCRegistry.InvalidExpiry.selector);
+        vm.prank(attester);
+        registry.issueAttestation(charlie, true, false, false, "US", uint64(block.timestamp - 1), bytes32(0));
+    }
+
+    function test_RevertWhen_IssueAttestation_ExpiryAtCurrentTimestamp() public {
+        vm.expectRevert(KYCRegistry.InvalidExpiry.selector);
+        vm.prank(attester);
+        registry.issueAttestation(charlie, true, false, false, "US", uint64(block.timestamp), bytes32(0));
+    }
+
+    // ─── L-2: revert revokeAttestation on non-existent wallet ─────────────────
+
+    function test_RevertWhen_RevokeNonExistentAttestation() public {
+        // charlie has no attestation — must revert with AttestationNotFound
+        vm.expectRevert(KYCRegistry.AttestationNotFound.selector);
+        vm.prank(attester);
+        registry.revokeAttestation(charlie);
     }
 }

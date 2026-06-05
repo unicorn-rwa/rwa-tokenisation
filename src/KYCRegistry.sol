@@ -29,6 +29,8 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
     error AlreadyRevoked();
     error AttestationNotFound();
     error ConflictingInvestorTypes();
+    error AttestationAlreadyActive();
+    error InvalidExpiry();
 
     // ─── Events ────────────────────────────────────────────────────────────────
     event AttestationIssued(
@@ -99,6 +101,10 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
         bytes32 pmIdHash
     ) external onlyRole(ATTESTER_ROLE) whenNotPaused {
         if (wallet == address(0)) revert ZeroAddress();
+        // M-1: prevent silent overwrite of an active attestation — revoke first
+        if (isVerified(wallet)) revert AttestationAlreadyActive();
+        // M-1: prevent past-dated issuance that silently "issues" an already-expired attestation
+        if (expiresAt <= block.timestamp) revert InvalidExpiry();
 
         // Investor types are mutually exclusive — exactly one must be set
         uint8 typeCount = (accreditedInvestor ? 1 : 0)
@@ -125,16 +131,20 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
 
     /// @notice Revoke attestation — called on PM webhook (accreditation.expired/revoked)
     function revokeAttestation(address wallet) external onlyRole(ATTESTER_ROLE) {
+        // L-2: reject calls on wallets with no attestation — prevents silent storage pollution
+        if (!_attestations[wallet].kycPassed) revert AttestationNotFound();
         if (_attestations[wallet].revoked) revert AlreadyRevoked();
         _attestations[wallet].revoked = true;
         emit AttestationRevoked(wallet);
     }
 
-    /// @notice Extend expiry — called on PM webhook (accreditation.updated/renewed)
+    /// @notice Extend expiry — called on PM webhook (accreditation.updated/renewed).
+    ///         Cannot be used to re-activate a manually revoked attestation — use
+    ///         issueAttestation() (requires admin Safe) for that instead.
     function updateExpiry(address wallet, uint64 newExpiry) external onlyRole(ATTESTER_ROLE) {
         if (!_attestations[wallet].kycPassed) revert AttestationNotFound();
+        if (_attestations[wallet].revoked) revert AlreadyRevoked();
         _attestations[wallet].expiresAt = newExpiry;
-        _attestations[wallet].revoked   = false; // re-activate if previously expired
         emit AttestationUpdated(wallet, newExpiry);
     }
 

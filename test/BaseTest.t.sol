@@ -14,57 +14,62 @@ import {ROIDistributor} from "../src/ROIDistributor.sol";
  *      All test contracts inherit from this to avoid boilerplate.
  *
  *      Actors:
- *        admin    — Gnosis Safe / platform owner
- *        attester — NestJS hot wallet that issues KYC attestations
- *        multisig — withdrawal recipient (simulates Gnosis Safe holding raised funds)
- *        alice    — US accredited investor (Reg D)
- *        bob      — Ukrainian investor (Reg S)
- *        charlie  — non-KYC'd user (all invest calls must revert for charlie)
+ *        admin       -- platform Gnosis Safe / factory owner
+ *        attester    -- NestJS hot wallet that issues KYC attestations
+ *        multisig    -- per-property OPERATIONAL Safe (spvAdmin):
+ *                       ADMIN_ROLE + PAUSER_ROLE on PropertyFunding,
+ *                       DEFAULT_ADMIN_ROLE on PropertyToken
+ *                       drives state machine: withdrawFunds, setActive, setCompleted, pause
+ *        spvTreasury -- per-property FINANCIAL Safe:
+ *                       withdrawal recipient in PropertyFunding (receives raised USDC),
+ *                       ADMIN_ROLE on ROIDistributor (calls depositReturns)
+ *        alice       -- US accredited investor (Reg D)
+ *        bob         -- Ukrainian investor (Reg S)
+ *        charlie     -- non-KYC'd user (all invest calls must revert for charlie)
+ *        dave        -- US non-accredited investor (Reg D 506b)
  */
 abstract contract BaseTest is Test {
     // ─── Actors ────────────────────────────────────────────────────────────────
-    address internal admin    = makeAddr("admin");
-    address internal attester = makeAddr("attester");
-    address internal multisig = makeAddr("multisig");
+    address internal admin       = makeAddr("admin");
+    address internal attester    = makeAddr("attester");
+    address internal multisig    = makeAddr("multisig");    // spvAdmin: operational Safe
+    address internal spvTreasury = makeAddr("spvTreasury"); // spvTreasury: financial Safe
     address internal alice    = makeAddr("alice");   // US accredited     (Reg D 506c, cap $25k)
     address internal bob      = makeAddr("bob");     // UA Reg S           (no cap)
     address internal charlie  = makeAddr("charlie"); // no KYC
     address internal dave     = makeAddr("dave");    // US non-accredited  (Reg D 506b, cap $2.5k)
 
     // ─── Contracts ─────────────────────────────────────────────────────────────
-    MockUSDC              internal usdc;
-    KYCRegistry           internal registry;
-    ROIDistributor        internal distributor;
+    MockUSDC               internal usdc;
+    KYCRegistry            internal registry;
+    ROIDistributor         internal distributor; // populated per-project in each test's setUp
     PropertyFundingFactory internal factory;
 
-    // Default project params — override in individual tests as needed
+    // Default project params -- override in individual tests as needed
     uint256 internal constant FUNDING_GOAL                = 200_000e6; // $200k USDC
     uint256 internal constant MIN_INVESTMENT              =   2_000e6; // $2k USDC
-    uint256 internal constant MAX_ACCREDITED_INVESTMENT   =  25_000e6; // $25k — Reg D 506(c) cap
-    uint256 internal constant MAX_NON_ACCREDITED_INVESTMENT =  2_500e6; // $2.5k — Reg D 506(b) cap
+    uint256 internal constant MAX_ACCREDITED_INVESTMENT   =  25_000e6; // $25k -- Reg D 506(c) cap
+    uint256 internal constant MAX_NON_ACCREDITED_INVESTMENT =  2_500e6; // $2.5k -- Reg D 506(b) cap
     uint256 internal constant ROI_BPS                     = 1_500;     // 15%
     uint256 internal constant DEADLINE_OFFSET             = 30 days;
 
     // ─── setUp ─────────────────────────────────────────────────────────────────
     function setUp() public virtual {
-        // Deploy infrastructure
+        // Deploy platform infrastructure
         vm.startPrank(admin);
-        usdc        = new MockUSDC();
-        registry    = new KYCRegistry(admin, attester);
-        distributor = new ROIDistributor(admin, address(usdc));
-        factory     = new PropertyFundingFactory(
+        usdc     = new MockUSDC();
+        registry = new KYCRegistry(admin, attester);
+        factory  = new PropertyFundingFactory(
             admin,
             address(usdc),
-            address(registry),
-            address(distributor)
+            address(registry)
         );
-        distributor.setFactory(address(factory));
         vm.stopPrank();
 
         // Issue KYC attestations via the attester wallet
         vm.startPrank(attester);
 
-        // Alice — US accredited investor (Reg D 506c, cap $25k/project)
+        // Alice -- US accredited investor (Reg D 506c, cap $25k/project)
         registry.issueAttestation(
             alice,
             true,  // accreditedInvestor
@@ -75,7 +80,7 @@ abstract contract BaseTest is Test {
             bytes32(0)
         );
 
-        // Bob — Ukrainian investor (Reg S, no cap)
+        // Bob -- Ukrainian investor (Reg S, no cap)
         registry.issueAttestation(
             bob,
             false, // accreditedInvestor
@@ -86,7 +91,7 @@ abstract contract BaseTest is Test {
             bytes32(0)
         );
 
-        // Dave — US non-accredited investor (Reg D 506b, cap $2.5k/project)
+        // Dave -- US non-accredited investor (Reg D 506b, cap $2.5k/project)
         registry.issueAttestation(
             dave,
             false, // accreditedInvestor
@@ -97,7 +102,7 @@ abstract contract BaseTest is Test {
             bytes32(0)
         );
 
-        // Charlie gets no attestation — all invest calls should revert
+        // Charlie gets no attestation -- all invest calls should revert
         vm.stopPrank();
 
         // US is restricted by default in KYCRegistry constructor (V1: non-US only).
@@ -109,16 +114,20 @@ abstract contract BaseTest is Test {
 
     // ─── Helpers ───────────────────────────────────────────────────────────────
 
-    /// @dev Deploy a default project via the factory. Returns (funding, token).
+    /// @dev Deploy a default project via the factory.
+    ///      Returns (funding, token, roi).
+    ///      multisig    = spvAdmin    (state machine, pause, metadata)
+    ///      spvTreasury = spvTreasury (withdrawal recipient, depositReturns)
     function _createProject()
         internal
-        returns (PropertyFunding funding, PropertyToken token)
+        returns (PropertyFunding funding, PropertyToken token, ROIDistributor roi)
     {
         vm.prank(admin);
-        (address f, address t) = factory.createProject(
+        (address f, address t, address r) = factory.createProject(
             "PropToken LA-2024-01",
             "PROP-LA-01",
-            multisig,
+            multisig,     // spvAdmin    -- operational Safe
+            spvTreasury,  // spvTreasury -- financial Safe
             FUNDING_GOAL,
             block.timestamp + DEADLINE_OFFSET,
             ROI_BPS,
@@ -131,6 +140,7 @@ abstract contract BaseTest is Test {
         );
         funding = PropertyFunding(f);
         token   = PropertyToken(t);
+        roi     = ROIDistributor(r);
     }
 
     /// @dev Give an investor USDC and pre-approve the funding contract.
