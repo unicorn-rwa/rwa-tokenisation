@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {BaseTest} from "./BaseTest.t.sol";
 import {PropertyFunding} from "../src/PropertyFunding.sol";
+import {PropertyFundingFactory} from "../src/PropertyFundingFactory.sol";
 import {PropertyToken} from "../src/PropertyToken.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
@@ -12,7 +13,7 @@ contract PropertyFundingTest is BaseTest {
 
     function setUp() public override {
         super.setUp();
-        (funding, token) = _createProject();
+        (funding, token,) = _createProject();
     }
 
     // ─── invest() ─────────────────────────────────────────────────────────────
@@ -122,7 +123,7 @@ contract PropertyFundingTest is BaseTest {
     function test_RevertWhen_InvestWhilePaused() public {
         _fundInvestor(alice, address(funding), MIN_INVESTMENT);
 
-        vm.prank(admin);
+        vm.prank(multisig);
         funding.pause();
 
         vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
@@ -187,25 +188,66 @@ contract PropertyFundingTest is BaseTest {
         funding.triggerRefund();
     }
 
-    function test_RevertWhen_TriggerRefund_GoalAlreadyMet() public {
-        // Once the goal is met invest() transitions state to FUNDED immediately.
-        // triggerRefund() requires FUNDRAISING, so it reverts with WrongState — not GoalAlreadyMet.
-        // GoalAlreadyMet is a defensive guard; WrongState fires first via the modifier.
-        // bob is Reg S (no cap) — can invest the full FUNDING_GOAL
+    function test_RevertWhen_TriggerRefund_GoalAlreadyMet_BeforeTimeout() public {
+        // Once the goal is met, state is FUNDED. triggerRefund() now accepts FUNDED
+        // state but only after WITHDRAWAL_TIMEOUT. Before the timeout it reverts.
         _fundInvestor(bob, address(funding), FUNDING_GOAL);
         vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
-        vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        assertEq(funding.fundedAt(), block.timestamp);
+
+        // Warp to just before the 30-day timeout
+        vm.warp(block.timestamp + funding.WITHDRAWAL_TIMEOUT() - 1);
+
+        vm.expectRevert(PropertyFunding.WithdrawalTimeoutNotReached.selector);
+        vm.prank(bob);
+        funding.triggerRefund();
+    }
+
+    // ─── H-1 escape hatch (FUNDED timeout) ────────────────────────────────────
+
+    function test_TriggerRefund_FromFunded_AfterTimeout() public {
+        // Admin goes dark — never calls withdrawFunds(). After 30 days any
+        // investor can force REFUNDING and recover their USDC.
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
+        funding.invest(FUNDING_GOAL); // state → FUNDED, fundedAt recorded
+
+        vm.warp(block.timestamp + funding.WITHDRAWAL_TIMEOUT() + 1);
+
+        vm.prank(bob);
+        funding.triggerRefund();
+
+        assertEq(uint8(funding.state()), uint8(PropertyFunding.State.REFUNDING));
+    }
+
+    function test_WithdrawFunds_DisarmsTimeout() public {
+        // Admin acts on day 25 — well within the 30-day window.
+        // After withdrawal state is WITHDRAWN; triggerRefund() from WITHDRAWN
+        // reverts with WrongState — the escape hatch is disarmed.
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
+        funding.invest(FUNDING_GOAL);
+
+        vm.warp(block.timestamp + 25 days);
+        vm.prank(multisig);
+        funding.withdrawFunds(); // state → WITHDRAWN
+
+        assertEq(uint8(funding.state()), uint8(PropertyFunding.State.WITHDRAWN));
+
+        // Warp past the original timeout — doesn't matter, state is WITHDRAWN
+        vm.warp(block.timestamp + funding.WITHDRAWAL_TIMEOUT() + 1);
 
         vm.expectRevert(
             abi.encodeWithSelector(
                 PropertyFunding.WrongState.selector,
                 PropertyFunding.State.FUNDRAISING,
-                PropertyFunding.State.FUNDED
+                PropertyFunding.State.WITHDRAWN
             )
         );
+        vm.prank(bob);
         funding.triggerRefund();
     }
 
@@ -272,15 +314,15 @@ contract PropertyFundingTest is BaseTest {
         vm.prank(bob);
         funding.invest(FUNDING_GOAL);
 
-        uint256 multisigBefore = usdc.balanceOf(multisig);
+        uint256 treasuryBefore = usdc.balanceOf(spvTreasury);
 
         vm.expectEmit(true, false, false, true);
-        emit PropertyFunding.FundsWithdrawn(multisig, FUNDING_GOAL);
+        emit PropertyFunding.FundsWithdrawn(spvTreasury, FUNDING_GOAL);
 
-        vm.prank(admin);
+        vm.prank(multisig); // spvAdmin drives state transition
         funding.withdrawFunds();
 
-        assertEq(usdc.balanceOf(multisig), multisigBefore + FUNDING_GOAL);
+        assertEq(usdc.balanceOf(spvTreasury), treasuryBefore + FUNDING_GOAL);
         assertEq(usdc.balanceOf(address(funding)), 0);
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.WITHDRAWN));
     }
@@ -319,18 +361,18 @@ contract PropertyFundingTest is BaseTest {
 
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
 
-        // 2. Admin withdraws to multisig (fiat conversion)
-        vm.prank(admin);
+        // 2. SPV multisig withdraws to itself (fiat conversion)
+        vm.prank(multisig);
         funding.withdrawFunds();
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.WITHDRAWN));
 
         // 3. Construction starts
-        vm.prank(admin);
+        vm.prank(multisig);
         funding.setActive();
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.ACTIVE));
 
         // 4. Construction completes
-        vm.prank(admin);
+        vm.prank(multisig);
         funding.setCompleted();
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.COMPLETED));
 
@@ -487,7 +529,7 @@ contract PropertyFundingTest is BaseTest {
     }
 
     function test_PushMetadataUpdate_AppendsToHistory() public {
-        vm.prank(admin);
+        vm.prank(multisig);
         funding.pushMetadataUpdate("ipfs://QmUpdate1");
 
         string[] memory history = funding.getMetadataHistory();
@@ -497,7 +539,7 @@ contract PropertyFundingTest is BaseTest {
     }
 
     function test_GetMetadataHistory_MultipleUpdates() public {
-        vm.startPrank(admin);
+        vm.startPrank(multisig);
         funding.pushMetadataUpdate("ipfs://QmUpdate1");
         funding.pushMetadataUpdate("ipfs://QmUpdate2");
         funding.pushMetadataUpdate("ipfs://QmUpdate3");
@@ -512,6 +554,52 @@ contract PropertyFundingTest is BaseTest {
         assertEq(funding.offeringDocHash(), "ipfs://QmTestHash");
     }
 
+    // ─── Deadline cap (C-2 fix) ────────────────────────────────────────────────
+
+    function test_RevertWhen_DeadlineExceeds180Days() public {
+        uint256 tooFar = block.timestamp + funding.MAX_FUNDRAISING_DURATION() + 1;
+
+        vm.expectRevert(PropertyFunding.DeadlineTooFar.selector);
+        vm.prank(admin);
+        factory.createProject(
+            "PropToken Test",
+            "PROP-TEST",
+            multisig,
+            spvTreasury,
+            FUNDING_GOAL,
+            tooFar,          // deadline > 180 days from now
+            ROI_BPS,
+            block.timestamp + 60 days,
+            block.timestamp + 540 days,
+            MIN_INVESTMENT,
+            MAX_ACCREDITED_INVESTMENT,
+            MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+    }
+
+    function test_AllowsDeadlineAtExactly180Days() public {
+        uint256 exactMax = block.timestamp + funding.MAX_FUNDRAISING_DURATION();
+
+        vm.prank(admin);
+        (address f,,) = factory.createProject(
+            "PropToken Test",
+            "PROP-TEST",
+            multisig,
+            spvTreasury,
+            FUNDING_GOAL,
+            exactMax,        // deadline == 180 days from now — must succeed
+            ROI_BPS,
+            block.timestamp + 60 days,
+            block.timestamp + 540 days,
+            MIN_INVESTMENT,
+            MAX_ACCREDITED_INVESTMENT,
+            MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+        assertEq(PropertyFunding(f).deadline(), exactMax);
+    }
+
     function test_PushMetadataUpdate_OnlyAdmin() public {
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -522,5 +610,137 @@ contract PropertyFundingTest is BaseTest {
         );
         vm.prank(alice);
         funding.pushMetadataUpdate("ipfs://evil");
+    }
+
+    // ─── M-2: spvAdmin == spvTreasury rejected by factory ─────────────────────
+
+    function test_RevertWhen_SpvAdminEqualsSpvTreasury() public {
+        vm.expectRevert(PropertyFundingFactory.RoleConflict.selector);
+        vm.prank(admin);
+        factory.createProject(
+            "PropToken Test", "PROP-TEST",
+            multisig,  // spvAdmin == spvTreasury — must revert
+            multisig,
+            FUNDING_GOAL, block.timestamp + DEADLINE_OFFSET,
+            ROI_BPS, block.timestamp + 60 days, block.timestamp + 540 days,
+            MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT, MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+    }
+
+    // ─── M-3: relational investment param validation ───────────────────────────
+
+    function test_RevertWhen_MinInvestment_ExceedsAccreditedCap() public {
+        uint256 bigMin = MAX_ACCREDITED_INVESTMENT + 1;
+        vm.expectRevert(PropertyFundingFactory.InvalidParam.selector);
+        vm.prank(admin);
+        factory.createProject(
+            "PropToken Test", "PROP-TEST",
+            multisig, spvTreasury,
+            FUNDING_GOAL, block.timestamp + DEADLINE_OFFSET,
+            ROI_BPS, block.timestamp + 60 days, block.timestamp + 540 days,
+            bigMin,                    // minInvestment > maxAccreditedInvestment
+            MAX_ACCREDITED_INVESTMENT,
+            MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+    }
+
+    function test_RevertWhen_MinInvestment_ExceedsNonAccreditedCap() public {
+        uint256 bigMin = MAX_NON_ACCREDITED_INVESTMENT + 1;
+        vm.expectRevert(PropertyFundingFactory.InvalidParam.selector);
+        vm.prank(admin);
+        factory.createProject(
+            "PropToken Test", "PROP-TEST",
+            multisig, spvTreasury,
+            FUNDING_GOAL, block.timestamp + DEADLINE_OFFSET,
+            ROI_BPS, block.timestamp + 60 days, block.timestamp + 540 days,
+            bigMin,                       // minInvestment > maxNonAccreditedUSInvestment
+            MAX_ACCREDITED_INVESTMENT,
+            MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+    }
+
+    // ─── M-4: withdrawFunds uses totalRaised, not balanceOf ───────────────────
+
+    function test_WithdrawFunds_UsesTotalRaised_NotAccidentalUSDC() public {
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
+        funding.invest(FUNDING_GOAL);
+
+        // Accidentally send extra USDC directly to the contract
+        uint256 accidental = 1_000e6;
+        usdc.mint(address(funding), accidental);
+        assertEq(usdc.balanceOf(address(funding)), FUNDING_GOAL + accidental);
+
+        uint256 treasuryBefore = usdc.balanceOf(spvTreasury);
+        vm.prank(multisig);
+        funding.withdrawFunds();
+
+        // Only totalRaised (FUNDING_GOAL) is transferred — accidental USDC stays in contract
+        assertEq(usdc.balanceOf(spvTreasury), treasuryBefore + FUNDING_GOAL);
+        assertEq(usdc.balanceOf(address(funding)), accidental);
+    }
+
+    // ─── H-4: MINTER_ROLE locked after deploy ─────────────────────────────────
+
+    function test_PropertyToken_MinterRole_LockedAfterDeploy() public {
+        // spvAdmin (multisig) should no longer have DEFAULT_ADMIN_ROLE on the token
+        assertFalse(token.hasRole(token.DEFAULT_ADMIN_ROLE(), multisig));
+        assertFalse(token.hasRole(token.DEFAULT_ADMIN_ROLE(), admin));
+
+        // Cannot grant MINTER_ROLE — no admin exists on the token
+        bytes32 minterRole = keccak256("MINTER_ROLE");
+        address attacker = makeAddr("attacker");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                multisig,
+                token.DEFAULT_ADMIN_ROLE()
+            )
+        );
+        vm.prank(multisig);
+        token.grantRole(minterRole, attacker);
+    }
+
+    // ─── L-3: MAX_INVESTORS cap ────────────────────────────────────────────────
+
+    function test_RevertWhen_InvestorCountExceedsMax() public {
+        // Create a project with a tiny funding goal so we can fill it with many investors
+        // Use a fresh project to avoid polluting setUp's funding
+        vm.prank(admin);
+        (address f,,) = factory.createProject(
+            "PropToken Cap", "PROP-CAP",
+            multisig, spvTreasury,
+            type(uint256).max,               // effectively unlimited goal
+            block.timestamp + DEADLINE_OFFSET,
+            ROI_BPS, block.timestamp + 60 days, block.timestamp + 540 days,
+            MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT, MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+        PropertyFunding capFunding = PropertyFunding(f);
+        uint256 cap = capFunding.MAX_INVESTORS();
+
+        // Register and invest for exactly MAX_INVESTORS unique Reg S wallets
+        for (uint256 i = 0; i < cap; i++) {
+            address inv = makeAddr(string(abi.encodePacked("regSInvestor", i)));
+            vm.prank(attester);
+            registry.issueAttestation(inv, false, false, true, "UA", uint64(block.timestamp + 365 days), bytes32(0));
+            _fundInvestor(inv, f, MIN_INVESTMENT);
+            vm.prank(inv);
+            capFunding.invest(MIN_INVESTMENT);
+        }
+        assertEq(capFunding.investorCount(), cap);
+
+        // One more unique investor should revert
+        address overflow = makeAddr("overflowInvestor");
+        vm.prank(attester);
+        registry.issueAttestation(overflow, false, false, true, "UA", uint64(block.timestamp + 365 days), bytes32(0));
+        _fundInvestor(overflow, f, MIN_INVESTMENT);
+
+        vm.expectRevert(PropertyFunding.TooManyInvestors.selector);
+        vm.prank(overflow);
+        capFunding.invest(MIN_INVESTMENT);
     }
 }
