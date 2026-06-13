@@ -19,12 +19,18 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
  *         1 USDC (1e6 units) = 1 PropertyToken (1e18 units)
  *         The 1e12 scaling is handled in PropertyFunding.
  *
- * Roles:
+ * Roles (least-privilege split — L-5):
  *   DEFAULT_ADMIN_ROLE — Gnosis Safe; manages roles
- *   MINTER_ROLE        — PropertyFunding + ROIDistributor; mint/burn
+ *   MINTER_ROLE        — PropertyFunding only; mint on invest()
+ *   BURNER_ROLE        — PropertyFunding (refund) + ROIDistributor (ROI claim); burn only
+ *
+ *   The distributor never mints, so it is granted BURNER_ROLE only. This keeps the
+ *   permanently-frozen role set (post H-4 admin lock) at minimum privilege: no contract
+ *   holds mint power it does not use.
  */
 contract PropertyToken is ERC20, AccessControl {
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
 
     // ─── Errors ────────────────────────────────────────────────────────────────
     error TransfersDisabled();
@@ -42,10 +48,13 @@ contract PropertyToken is ERC20, AccessControl {
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         // Also grant DEFAULT_ADMIN_ROLE to minter (the factory) so it can wire up
-        // MINTER_ROLE to PropertyFunding + ROIDistributor after deployment.
-        // Factory revokes its own DEFAULT_ADMIN_ROLE once setup is complete.
+        // MINTER_ROLE / BURNER_ROLE to PropertyFunding + ROIDistributor after deployment.
+        // Factory revokes its own roles once setup is complete.
+        // The minter (operator) gets both mint and burn so a directly-deployed token
+        // is fully operable; the factory revokes both from itself during createProject.
         _grantRole(DEFAULT_ADMIN_ROLE, minter);
         _grantRole(MINTER_ROLE, minter);
+        _grantRole(BURNER_ROLE, minter);
     }
 
     // ─── Minter actions ────────────────────────────────────────────────────────
@@ -54,7 +63,7 @@ contract PropertyToken is ERC20, AccessControl {
         _mint(to, amount);
     }
 
-    function burn(address from, uint256 amount) external onlyRole(MINTER_ROLE) {
+    function burn(address from, uint256 amount) external onlyRole(BURNER_ROLE) {
         _burn(from, amount);
     }
 

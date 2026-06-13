@@ -704,6 +704,45 @@ contract PropertyFundingTest is BaseTest {
         token.grantRole(minterRole, attacker);
     }
 
+    // ─── L-5: MINTER/BURNER least-privilege split ─────────────────────────────
+
+    function test_PropertyToken_RoleSplit_LeastPrivilege() public {
+        // Fresh project so we can inspect all three contracts' roles
+        (PropertyFunding f, PropertyToken t,) = _createProject();
+        address roi = factory.projectDistributor(address(f));
+
+        bytes32 minterRole = t.MINTER_ROLE();
+        bytes32 burnerRole = t.BURNER_ROLE();
+
+        // Funding can both mint (invest) and burn (refund)
+        assertTrue(t.hasRole(minterRole, address(f)), "funding missing MINTER_ROLE");
+        assertTrue(t.hasRole(burnerRole, address(f)), "funding missing BURNER_ROLE");
+
+        // Distributor can burn (ROI claim) but must NOT be able to mint
+        assertTrue(t.hasRole(burnerRole, roi),  "distributor missing BURNER_ROLE");
+        assertFalse(t.hasRole(minterRole, roi), "distributor must not hold MINTER_ROLE");
+
+        // Factory retains nothing after wiring
+        assertFalse(t.hasRole(minterRole, address(factory)), "factory still has MINTER_ROLE");
+        assertFalse(t.hasRole(burnerRole, address(factory)), "factory still has BURNER_ROLE");
+    }
+
+    function test_RevertWhen_DistributorAttemptsMint() public {
+        (PropertyFunding f, PropertyToken t,) = _createProject();
+        address roi = factory.projectDistributor(address(f));
+
+        // Even the distributor — which legitimately burns — cannot mint unbacked tokens
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                roi,
+                t.MINTER_ROLE()
+            )
+        );
+        vm.prank(roi);
+        t.mint(roi, 1_000e18);
+    }
+
     // ─── L-3: MAX_INVESTORS cap ────────────────────────────────────────────────
 
     function test_RevertWhen_InvestorCountExceedsMax() public {

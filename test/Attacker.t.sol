@@ -275,12 +275,12 @@ contract AttackerTest is BaseTest {
         uint256 aliceBalance = token.balanceOf(alice);
         assertGt(aliceBalance, 0);
 
-        // Attacker tries to burn alice's tokens
+        // Attacker tries to burn alice's tokens — burn is gated by BURNER_ROLE (L-5 split)
         vm.expectRevert(
             abi.encodeWithSelector(
                 IAccessControl.AccessControlUnauthorizedAccount.selector,
                 charlie,
-                token.MINTER_ROLE()
+                token.BURNER_ROLE()
             )
         );
         vm.prank(charlie);

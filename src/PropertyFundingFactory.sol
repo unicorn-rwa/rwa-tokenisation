@@ -5,6 +5,7 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {PropertyToken} from "./PropertyToken.sol";
 import {PropertyFunding} from "./PropertyFunding.sol";
 import {ROIDistributor} from "./ROIDistributor.sol";
+import {PropertyFundingDeployer} from "./lib/PropertyFundingDeployer.sol";
 
 /**
  * @title PropertyFundingFactory
@@ -16,9 +17,9 @@ import {ROIDistributor} from "./ROIDistributor.sol";
  *           1. Deploy PropertyToken (factory holds temp MINTER_ROLE)
  *           2. Deploy PropertyFunding (admin = spvMultisig)
  *           3. Deploy ROIDistributor (admin = spvMultisig, project = PropertyFunding)
- *           4. Grant MINTER_ROLE to PropertyFunding (invest/refund)
- *           5. Grant MINTER_ROLE to ROIDistributor  (ROI claim burns)
- *           6. Revoke factory's own MINTER_ROLE + DEFAULT_ADMIN_ROLE on token
+ *           4. Grant MINTER_ROLE + BURNER_ROLE to PropertyFunding (invest mints, refund burns)
+ *           5. Grant BURNER_ROLE only to ROIDistributor  (ROI claim burns; never mints)
+ *           6. Revoke factory's own MINTER_ROLE + BURNER_ROLE + DEFAULT_ADMIN_ROLE on token
  *
  * Roles (factory-level only):
  *   DEFAULT_ADMIN_ROLE — platform Gnosis Safe
@@ -142,21 +143,30 @@ contract PropertyFundingFactory is AccessControl {
         // 2. Deploy PropertyFunding
         //    spvAdmin    → ADMIN_ROLE + PAUSER_ROLE (state transitions)
         //    spvTreasury → withdrawalRecipient (receives raised USDC)
-        PropertyFunding funding = new PropertyFunding(
-            usdc,
-            address(token),
-            kycRegistry,
-            spvTreasury, // withdrawalRecipient = financial SPV Safe
-            spvAdmin,    // admin = operational SPV Safe
-            fundingGoal,
-            deadline,
-            expectedROIBps,
-            estimatedStartDate,
-            estimatedEndDate,
-            minInvestment,
-            maxAccreditedInvestment,
-            maxNonAccreditedUSInvestment,
-            offeringDocHash
+        //    Deployed via PropertyFundingDeployer (external library, delegatecall)
+        //    purely so PropertyFunding's creation bytecode lives in the library,
+        //    not the factory — keeps the factory under the EIP-170 size limit.
+        //    delegatecall runs in this factory's context, so the factory is still
+        //    the deployer and the child address is identical to an inline deploy.
+        PropertyFunding funding = PropertyFunding(
+            PropertyFundingDeployer.deploy(
+                PropertyFundingDeployer.Params({
+                    usdc:                         usdc,
+                    propertyToken:                address(token),
+                    kycRegistry:                  kycRegistry,
+                    withdrawalRecipient:          spvTreasury, // financial SPV Safe
+                    admin:                        spvAdmin,    // operational SPV Safe
+                    fundingGoal:                  fundingGoal,
+                    deadline:                     deadline,
+                    expectedROIBps:               expectedROIBps,
+                    estimatedStartDate:           estimatedStartDate,
+                    estimatedEndDate:             estimatedEndDate,
+                    minInvestment:                minInvestment,
+                    maxAccreditedInvestment:      maxAccreditedInvestment,
+                    maxNonAccreditedUSInvestment: maxNonAccreditedUSInvestment,
+                    offeringDocHash:              offeringDocHash
+                })
+            )
         );
 
         // 3. Deploy ROIDistributor — tied to this property
@@ -167,18 +177,22 @@ contract PropertyFundingFactory is AccessControl {
             address(funding) // project this distributor serves
         );
 
-        // 4+5. Wire up MINTER_ROLE — funding contract mints on invest(), burns on refund()
-        //      ROI distributor burns tokens when investor claims ROI
+        // 4+5. Wire up roles with least privilege (L-5):
+        //      funding mints on invest() and burns on refund()  → MINTER_ROLE + BURNER_ROLE
+        //      roi only burns when an investor claims ROI        → BURNER_ROLE only
         bytes32 minterRole = keccak256("MINTER_ROLE");
+        bytes32 burnerRole = keccak256("BURNER_ROLE");
         token.grantRole(minterRole, address(funding));
-        token.grantRole(minterRole, address(roi));
+        token.grantRole(burnerRole, address(funding));
+        token.grantRole(burnerRole, address(roi)); // distributor never mints — burn only
 
-        // 6. Revoke all admin roles from PropertyToken — MINTER_ROLE is frozen forever.
+        // 6. Revoke all admin roles from PropertyToken — the role set is frozen forever.
         //    H-4: revoke spvAdmin's DEFAULT_ADMIN_ROLE so no one can grant extra
-        //         MINTER_ROLE addresses post-deploy. Do this before revoking factory's own
+        //         minter/burner addresses post-deploy. Do this before revoking factory's own
         //         DEFAULT_ADMIN_ROLE (factory must still have it to call revokeRole).
         token.revokeRole(minterRole, address(this));
-        token.revokeRole(DEFAULT_ADMIN_ROLE, spvAdmin);   // H-4: lock MINTER_ROLE permanently
+        token.revokeRole(burnerRole, address(this));
+        token.revokeRole(DEFAULT_ADMIN_ROLE, spvAdmin);   // H-4: lock the role set permanently
         token.revokeRole(DEFAULT_ADMIN_ROLE, address(this)); // factory self-revokes last
 
         projects.push(address(funding));
