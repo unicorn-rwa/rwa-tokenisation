@@ -78,9 +78,20 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     // investors can force a refund (H-1 escape hatch)
     uint256 public constant WITHDRAWAL_TIMEOUT = 30 days;
 
-    // L-3: cap investor count so commitDistribution() gas stays within Base block limits
-    // (500 investors ≈ 20.5M gas on commitDistribution — 34% of Base block)
-    uint256 public constant MAX_INVESTORS = 500;
+    // L-3: cap investor count so ROIDistributor.commitDistribution() gas stays bounded.
+    // After the H-B rework (sorted O(n) dedup + event-only claimant list) commitDistribution
+    // is linear and fits comfortably in a block at this cap (~6M gas @ 2000). Mirrored by
+    // ROIDistributor.MAX_CLAIMANTS and PropertyFundingFactory.MAX_INVESTORS — keep in sync.
+    // Under the M-B invariant (fundingGoal <= minInvestment * MAX_INVESTORS) the goal is
+    // always reached before this many distinct investors can join, so the cap is also an
+    // unreachable defense-in-depth backstop — the goal-met transition bounds the count.
+    uint256 public constant MAX_INVESTORS = 2000;
+
+    /// @notice Fat-finger guard on the ROI recorded at completion (I-3). Generous — it only
+    ///         rejects absurd typos, not legitimate high returns. Not a security boundary;
+    ///         the real protection is that finalROIBps is set by a separate Safe (spvAdmin)
+    ///         from the one that commits the distribution tree (spvTreasury).
+    uint256 public constant MAX_FINAL_ROI_BPS = 100_000; // 1000%
 
     // ─── Offering document (immutable) ────────────────────────────────────────
     /// @notice Original IPFS CID of the legal offering documents, set at deploy.
@@ -89,7 +100,17 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
 
     // ─── Mutable state ─────────────────────────────────────────────────────────
     uint256 public totalRaised;
+    uint256 public totalRefunded; // L-3: cumulative USDC refunded — tracks outstanding refund liability so sweepStrayUSDC() never touches owed funds
     uint256 public fundedAt; // timestamp when state → FUNDED; 0 until goal is met
+
+    /// @notice Actual realized ROI in basis points, recorded by ADMIN_ROLE at setCompleted()
+    ///         (I-3). The ROIDistributor caps every claim at principal * (1 + finalROIBps)
+    ///         (+ a small rounding buffer), so a compromised distribution tree cannot pay any
+    ///         wallet more than its true entitlement. Set by the operational (spvAdmin) Safe —
+    ///         a DIFFERENT Safe than the spvTreasury that commits the tree — so inflating a
+    ///         payout would require BOTH Safes to be compromised (separation of duties).
+    ///         May legitimately be 0 (principal-only return). 0 until COMPLETED.
+    uint256 public finalROIBps;
 
     /// @notice Append-only update log: construction photos, progress reports, etc.
     ///         Index 0 is the first post-deploy update. Use latestMetadata() for UI.
@@ -105,6 +126,8 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     event FundsWithdrawn(address indexed recipient, uint256 usdcAmount);
     event StateChanged(State indexed from, State indexed to);
     event MetadataUpdatePushed(string cid, uint256 indexed index, uint256 timestamp);
+    event StrayFundsSwept(address indexed recipient, uint256 amount);
+    event ProjectCompleted(uint256 finalROIBps);
 
     // ─── Errors ────────────────────────────────────────────────────────────────
     error WrongState(State required, State actual);
@@ -122,6 +145,9 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     error ZeroAddress();
     error InvalidParam();
     error TooManyInvestors();
+    error GoalExceedsCapacity();
+    error NothingToSweep();
+    error ROITooHigh();
 
     // ─── Modifiers ─────────────────────────────────────────────────────────────
     modifier onlyState(State required) {
@@ -165,6 +191,11 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
         // M-3: relational validation — min must not exceed per-investor caps
         if (minInvestment_ > maxAccreditedInvestment_) revert InvalidParam();
         if (minInvestment_ > maxNonAccreditedUSInvestment_) revert InvalidParam();
+        // M-B: goal must be reachable within MAX_INVESTORS at the minimum ticket size.
+        //      Guarantees FUNDED is reached before the investor cap, so the cap can never
+        //      block a still-unmet raise (eliminates Sybil slot-exhaustion DoS) and keeps
+        //      the investor count bounded by construction.
+        if (fundingGoal_ > minInvestment_ * MAX_INVESTORS) revert GoalExceedsCapacity();
 
         usdc                        = IERC20(usdc_);
         propertyToken               = PropertyToken(propertyToken_);
@@ -254,6 +285,7 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
 
         // Effects
         investments[msg.sender] = 0;
+        totalRefunded += amount; // L-3: shrink outstanding refund liability
 
         // Interactions
         uint256 tokenBalance = propertyToken.balanceOf(msg.sender);
@@ -299,15 +331,22 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @notice Mark project as COMPLETED once construction is done.
-     *         ROIDistributor.depositReturns() is called separately.
+     * @notice Mark project as COMPLETED once construction is done, recording the actual
+     *         realized ROI (I-3). The ROIDistributor reads finalROIBps to cap every claim
+     *         at the holder's true entitlement, so the distribution flow must be driven only
+     *         after this is set. ROIDistributor funding/claims are handled separately.
+     * @param finalROIBps_ Actual realized return in basis points (e.g. 1500 = 15%). May be 0
+     *                     for a principal-only return. Must be <= MAX_FINAL_ROI_BPS.
      */
-    function setCompleted()
+    function setCompleted(uint256 finalROIBps_)
         external
         onlyRole(ADMIN_ROLE)
         onlyState(State.ACTIVE)
     {
+        if (finalROIBps_ > MAX_FINAL_ROI_BPS) revert ROITooHigh();
+        finalROIBps = finalROIBps_;
         _transitionTo(State.COMPLETED);
+        emit ProjectCompleted(finalROIBps_);
     }
 
     /**
@@ -343,6 +382,21 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
         emit MetadataUpdatePushed(cid, _metadataUpdates.length - 1, block.timestamp);
     }
 
+    /**
+     * @notice Sweep stray USDC (e.g. tokens transferred directly to this contract by
+     *         mistake) to the treasury. L-3: only ever moves funds that are NOT owed to
+     *         investors — see strayUSDC() for exactly how much that is per state. Reverts
+     *         while the raise is still live/awaiting withdrawal (FUNDRAISING/FUNDED), where
+     *         every USDC is owed. Sends to withdrawalRecipient (the treasury), same as
+     *         withdrawFunds().
+     */
+    function sweepStrayUSDC() external nonReentrant onlyRole(ADMIN_ROLE) {
+        uint256 amount = strayUSDC();
+        if (amount == 0) revert NothingToSweep();
+        usdc.safeTransfer(withdrawalRecipient, amount);
+        emit StrayFundsSwept(withdrawalRecipient, amount);
+    }
+
     // ─── View helpers ──────────────────────────────────────────────────────────
 
     function investorCount() external view returns (uint256) {
@@ -356,6 +410,31 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
     function amountLeftToFund() external view returns (uint256) {
         if (totalRaised >= fundingGoal) return 0;
         return fundingGoal - totalRaised;
+    }
+
+    /**
+     * @notice USDC held by this contract that is NOT owed to investors and may be swept
+     *         to the treasury via sweepStrayUSDC() (L-3). Returns:
+     *           - FUNDRAISING / FUNDED      → 0 (every USDC is owed: refundable or pending
+     *                                         withdrawal — sweeping is disallowed here)
+     *           - WITHDRAWN/ACTIVE/COMPLETED→ full balance (the tracked principal already
+     *                                         left via withdrawFunds; ROI lives in the
+     *                                         separate ROIDistributor, so anything here is
+     *                                         a stray transfer)
+     *           - REFUNDING / REFUNDED      → balance minus the still-unclaimed refund
+     *                                         liability (totalRaised - totalRefunded), so
+     *                                         every unclaimed refund stays fully funded
+     */
+    function strayUSDC() public view returns (uint256) {
+        uint256 bal = usdc.balanceOf(address(this));
+        if (state == State.WITHDRAWN || state == State.ACTIVE || state == State.COMPLETED) {
+            return bal;
+        }
+        if (state == State.REFUNDING || state == State.REFUNDED) {
+            uint256 owed = totalRaised - totalRefunded; // refunds not yet claimed
+            return bal > owed ? bal - owed : 0;
+        }
+        return 0; // FUNDRAISING / FUNDED — everything is owed
     }
 
     function isDeadlinePassed() external view returns (bool) {

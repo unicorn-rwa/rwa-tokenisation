@@ -182,4 +182,22 @@ abstract contract BaseTest is Test {
         proof2 = new bytes32[](1);
         proof2[0] = leaf1;
     }
+
+    /// @dev Build a 2-claimant array sorted ascending by wallet — the ordering
+    ///      commitDistribution() now requires. For a 2-leaf sorted-pair tree the Merkle
+    ///      root and proofs are order-independent, so callers may pass either order.
+    function _claimants2(address w1, uint256 a1, address w2, uint256 a2)
+        internal
+        pure
+        returns (ROIDistributor.Claimant[] memory c)
+    {
+        c = new ROIDistributor.Claimant[](2);
+        if (w1 < w2) {
+            c[0] = ROIDistributor.Claimant({wallet: w1, amount: a1});
+            c[1] = ROIDistributor.Claimant({wallet: w2, amount: a2});
+        } else {
+            c[0] = ROIDistributor.Claimant({wallet: w2, amount: a2});
+            c[1] = ROIDistributor.Claimant({wallet: w1, amount: a1});
+        }
+    }
 }

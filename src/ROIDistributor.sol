@@ -16,10 +16,13 @@ import {PropertyToken} from "./PropertyToken.sol";
  *         its own isolated distributor, controlled by its own spvTreasury Safe.
  *
  *         Two-step distribution flow:
- *           1. spvTreasury calls commitDistribution() with the full claimants list.
- *              The Merkle root is computed ON-CHAIN from the claimants array, so
- *              getClaimants() is the authoritative source — it cannot disagree with
- *              what claim() enforces.
+ *           1. spvTreasury calls commitDistribution() with the full claimants list,
+ *              sorted strictly ascending by wallet. The Merkle root is computed
+ *              ON-CHAIN from that exact calldata, so claim() can never disagree with
+ *              what was committed. The list is NOT stored on-chain (H-B gas) — it is
+ *              emitted in full in the DistributionCommitted event, which (together with
+ *              the tx calldata) is the permanent, authoritative record. Off-chain
+ *              consumers read the event to display / verify the distribution.
  *           2. spvTreasury calls depositFunds() one or more times until the full
  *              required amount is deposited. Claims auto-unlock when totalDeposited
  *              reaches totalRequired.
@@ -32,7 +35,7 @@ import {PropertyToken} from "./PropertyToken.sol";
  *
  *         Unclaimed funds recovery:
  *           recoverFunds() — sweeps remaining USDC to spvTreasury after RECOVERY_DELAY
- *                            (180 days from commitDistribution() call).
+ *                            (180 days from when claims are enabled — see H-1).
  *
  * Roles:
  *   DEFAULT_ADMIN_ROLE — per-property financial Gnosis Safe (spvTreasury)
@@ -47,8 +50,22 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     address public immutable project;            // PropertyFunding this distributor serves
     address public immutable withdrawRecipient;  // spvTreasury: destination for withdrawDeposit() and recoverFunds()
 
-    /// @notice 180 days from commitDistribution() before unclaimed funds can be recovered.
+    /// @notice 180 days from when claims are enabled (full deposit received) before
+    ///         unclaimed funds can be recovered.
     uint256 public constant RECOVERY_DELAY = 180 days;
+
+    /// @notice Hard cap on committed claimants — mirrors PropertyFunding.MAX_INVESTORS
+    ///         (the claimant set is the investor set). Guarantees commitDistribution()
+    ///         always fits in a block regardless of input (H-B). Keep in sync.
+    uint256 public constant MAX_CLAIMANTS = 2000;
+
+    /// @notice Basis-point denominator (100% = 10_000).
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+
+    /// @notice Slack added over finalROIBps when capping a claim (I-3), to absorb the
+    ///         operator's pro-rata rounding / dust. Small enough that it can't meaningfully
+    ///         inflate a payout — a claim may exceed principal*(1+finalROI) by at most 0.25%.
+    uint256 public constant CLAIM_CAP_BUFFER_BPS = 25;
 
     // ─── Data structures ──────────────────────────────────────────────────────
 
@@ -58,22 +75,28 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     }
 
     struct Distribution {
-        bytes32 merkleRoot;     // computed on-chain from _claimants — never set manually
+        bytes32 merkleRoot;     // computed on-chain from the committed calldata — never set manually
         uint256 totalRequired;  // sum of all claimant amounts
         uint256 totalDeposited; // USDC actually transferred into this contract
         uint256 totalClaimed;   // USDC paid out to investors
     }
 
     Distribution public distribution;
-    Claimant[] private _claimants;
+    // NOTE: the claimant list is intentionally NOT stored on-chain (H-B gas). It lives in
+    // the DistributionCommitted event + tx calldata, and the Merkle root is derived from it.
     mapping(address => bool) public claimed;
 
     /// @notice Timestamp after which recoverFunds() may be called.
-    ///         Set at commitDistribution() time. 0 = never committed.
+    ///         Set when claims are enabled (totalDeposited first reaches totalRequired),
+    ///         NOT at commit time — this guarantees investors always get the full
+    ///         RECOVERY_DELAY window to claim after claims open (H-1). A delay between
+    ///         commitDistribution() and depositFunds() can no longer compress that window.
+    ///         0 = claims not yet enabled (never committed, or committed but underfunded).
     uint256 public recoveryUnlocksAt;
 
     // ─── Events ────────────────────────────────────────────────────────────────
-    event DistributionCommitted(bytes32 indexed merkleRoot, uint256 totalRequired, uint256 claimantCount);
+    // claimants carries the FULL committed list (event is the on-chain record of the tree)
+    event DistributionCommitted(bytes32 indexed merkleRoot, uint256 totalRequired, uint256 claimantCount, Claimant[] claimants);
     event FundsDeposited(uint256 amount, uint256 totalDeposited);
     event ClaimsEnabled(uint256 totalDeposited);
     event CommitmentCancelled();
@@ -83,12 +106,14 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
 
     // ─── Errors ────────────────────────────────────────────────────────────────
     error AlreadyClaimed();
+    error ClaimExceedsEntitlement(uint256 requested, uint256 maxAllowed);
     error AlreadyCommitted();
     error AlreadyFullyFunded();
     error ClaimsAlreadyEnabled();
     error ClaimsNotEnabled();
     error DepositNotEmpty();
-    error DuplicateClaimant(address wallet);
+    error UnsortedClaimants(address wallet);
+    error TooManyClaimants();
     error EmptyClaimants();
     error InvalidProof();
     error NoCommitment();
@@ -120,15 +145,24 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     // ─── Admin: commit ─────────────────────────────────────────────────────────
 
     /**
-     * @notice Commit the distribution tree. The Merkle root is computed on-chain
-     *         from `claimants_`, guaranteeing that getClaimants() and claim() are
-     *         always in sync. No USDC is transferred at this step.
+     * @notice Commit the distribution tree. The Merkle root is computed on-chain from
+     *         `claimants_`, guaranteeing claim() can never disagree with what was
+     *         committed. No USDC is transferred at this step.
      *
-     *         Call cancelCommitment() + recommit to fix errors — only possible
-     *         before any USDC has been deposited via depositFunds().
+     *         `claimants_` MUST be sorted strictly ascending by wallet. Ascending order
+     *         is verified in a single O(n) pass that simultaneously enforces:
+     *           - no duplicate wallets (each must be > the previous), and
+     *           - no zero address (the first must be > address(0)).
+     *         This replaces the old O(n²) storage-read dedup (H-B). The claimant list is
+     *         NOT persisted on-chain — it is emitted in full in DistributionCommitted, so
+     *         commitDistribution scales linearly and stays well within a block even at the
+     *         MAX_CLAIMANTS cap.
      *
-     * @param claimants_ Full list of (wallet, amount) pairs.
-     *                   No duplicates or zero addresses/amounts allowed.
+     *         Call cancelCommitment() + recommit to fix errors — only possible before any
+     *         USDC has been deposited via depositFunds().
+     *
+     * @param claimants_ Full list of (wallet, amount) pairs, sorted ascending by wallet.
+     *                   No duplicates, zero addresses, or zero amounts allowed.
      */
     function commitDistribution(Claimant[] calldata claimants_)
         external
@@ -137,31 +171,32 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     {
         if (distribution.totalRequired != 0) revert AlreadyCommitted();
         if (claimants_.length == 0) revert EmptyClaimants();
+        if (claimants_.length > MAX_CLAIMANTS) revert TooManyClaimants();
         if (PropertyFunding(project).state() != PropertyFunding.State.COMPLETED)
             revert ProjectNotCompleted();
 
+        // Single O(n) pass over calldata. Strictly-ascending wallets ⇒ no dupes, no zero
+        // address. prev starts at address(0) so the first wallet must be strictly greater.
         uint256 total = 0;
+        address prev = address(0);
         for (uint256 i = 0; i < claimants_.length; i++) {
-            if (claimants_[i].wallet == address(0)) revert ZeroAddress();
-            if (claimants_[i].amount == 0) revert ZeroAmount();
-
-            // O(n²) duplicate check — acceptable for ≤ ~1 000 investors
-            for (uint256 j = 0; j < i; j++) {
-                if (_claimants[j].wallet == claimants_[i].wallet)
-                    revert DuplicateClaimant(claimants_[i].wallet);
-            }
-
-            _claimants.push(claimants_[i]);
-            total += claimants_[i].amount;
+            address wallet = claimants_[i].wallet;
+            uint256 amount = claimants_[i].amount;
+            if (wallet <= prev) revert UnsortedClaimants(wallet);
+            if (amount == 0) revert ZeroAmount();
+            prev = wallet;
+            total += amount;
         }
 
         bytes32 root = _computeMerkleRoot(claimants_);
 
         distribution.merkleRoot    = root;
         distribution.totalRequired = total;
-        recoveryUnlocksAt          = block.timestamp + RECOVERY_DELAY;
+        // recoveryUnlocksAt is intentionally NOT set here (H-1). The recovery clock starts
+        // only when claims actually open (depositFunds reaches totalRequired), so an
+        // arbitrary gap between commit and deposit can't shrink the investor claim window.
 
-        emit DistributionCommitted(root, total, claimants_.length);
+        emit DistributionCommitted(root, total, claimants_.length, claimants_);
     }
 
     // ─── Admin: deposit ────────────────────────────────────────────────────────
@@ -188,6 +223,9 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
         emit FundsDeposited(amount, distribution.totalDeposited);
 
         if (distribution.totalDeposited >= distribution.totalRequired) {
+            // Claims just opened — start the recovery clock now (H-1). This branch runs
+            // exactly once: any subsequent depositFunds reverts AlreadyFullyFunded above.
+            recoveryUnlocksAt = block.timestamp + RECOVERY_DELAY;
             emit ClaimsEnabled(distribution.totalDeposited);
         }
     }
@@ -230,8 +268,9 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
         if (distribution.totalDeposited > 0) revert DepositNotEmpty();
 
         delete distribution;
-        delete _claimants;  // sets array length to 0
         recoveryUnlocksAt = 0;
+        // No _claimants array to clear — the cancelled tree's list remains only in its
+        // (now superseded) DistributionCommitted event; a fresh commit emits a new one.
 
         emit CommitmentCancelled();
     }
@@ -241,14 +280,15 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
     /**
      * @notice Sweep remaining USDC to spvTreasury after RECOVERY_DELAY.
      *         Intended for permanently unclaimed funds (e.g. investors lost wallet access).
-     *         Recovery window opens 180 days after commitDistribution() was called.
+     *         Recovery window opens 180 days after claims were enabled (full deposit),
+     *         guaranteeing investors a full RECOVERY_DELAY to claim once claims open (H-1).
      */
     function recoverFunds()
         external
         nonReentrant
         onlyRole(ADMIN_ROLE)
     {
-        if (recoveryUnlocksAt == 0) revert RecoveryTooEarly();             // never committed
+        if (recoveryUnlocksAt == 0) revert RecoveryTooEarly();             // claims never enabled
         if (block.timestamp < recoveryUnlocksAt) revert RecoveryTooEarly();
         uint256 amount = usdc.balanceOf(address(this));
         if (amount == 0) revert NothingToRecover();
@@ -277,12 +317,26 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
         if (!MerkleProof.verify(proof, distribution.merkleRoot, leaf))
             revert InvalidProof();
 
+        // Defense-in-depth (I-3): cap the payout by the claimant's actual on-chain principal
+        // and the admin-set finalROIBps (+ a small rounding buffer). Even if a compromised
+        // tree-builder commits an inflated amount for a real investor — or any amount for a
+        // wallet that never invested (principal 0 ⇒ cap 0) — the claim can't exceed
+        // principal * (1 + finalROIBps). finalROIBps is set by the spvAdmin Safe at
+        // setCompleted(), a DIFFERENT Safe than the spvTreasury that commits the tree, so
+        // inflating a payout would require BOTH Safes to be compromised.
+        PropertyFunding fundingProject = PropertyFunding(project);
+        uint256 principal = fundingProject.investments(msg.sender);
+        uint256 maxClaim = principal
+            * (BPS_DENOMINATOR + fundingProject.finalROIBps() + CLAIM_CAP_BUFFER_BPS)
+            / BPS_DENOMINATOR;
+        if (claimableAmount > maxClaim) revert ClaimExceedsEntitlement(claimableAmount, maxClaim);
+
         // Effects
         claimed[msg.sender] = true;
         distribution.totalClaimed += claimableAmount;
 
         // Burn caller's PropertyTokens (receipt tokens have served their purpose)
-        PropertyToken token = PropertyFunding(project).propertyToken();
+        PropertyToken token = fundingProject.propertyToken();
         uint256 tokenBalance = token.balanceOf(msg.sender);
         if (tokenBalance > 0) {
             token.burn(msg.sender, tokenBalance);
@@ -302,16 +356,9 @@ contract ROIDistributor is AccessControl, ReentrancyGuard {
                distribution.totalDeposited >= distribution.totalRequired;
     }
 
-    /**
-     * @notice Full list of (wallet, amount) pairs committed on-chain.
-     *         The Merkle root is derived directly from this list — it is the
-     *         authoritative source of what each investor can claim. Use this
-     *         to verify the on-chain tree matches your legal distribution records
-     *         before calling depositFunds().
-     */
-    function getClaimants() external view returns (Claimant[] memory) {
-        return _claimants;
-    }
+    // NOTE: getClaimants() was removed with the on-chain _claimants array (H-B). The full
+    // committed list is available from the DistributionCommitted event (and the original tx
+    // calldata) — index it off-chain (e.g. the NestJS backend) to display/verify the tree.
 
     function getDistribution() external view returns (Distribution memory) {
         return distribution;

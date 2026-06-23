@@ -41,13 +41,16 @@ fi
 
 # ── Deterministic Anvil addresses + keys (from well-known mnemonic) ────────
 # These are PUBLIC test keys — local dev only, never use on mainnet.
-DEPLOYER="0xf39Fd6e51aad88ce6aB8827279cffFb92266"
-DEPLOYER_KEY="0x238ff944bacbed5efcae784d7bf4f2ff80"
-ALICE="0x15d34AAf54267DB7D7c339AAf71A00a2C6A65"
-BOB="0x9965507D1a55bcC26a16FB37d819B0A4dc"
-DAVE="0x976EA74026E726B657fA54763abd0C3a0aa9"
-INVESTOR5="0x23618e81E3f5cdF7f54C3d65B21E8f"
-INVESTOR6="0xa0Ee7A142d267C1f3675612F20a79720"
+DEPLOYER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+DEPLOYER_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+ALICE="0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"
+BOB="0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"
+DAVE="0x976EA74026E726554dB657fA54763abd0C3a0aa9"
+INVESTOR5="0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"
+INVESTOR6="0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+SPV_ADDRESS="0x903a5AF6fC2B7f5cf1262962d59b4E2FBb48a5e8"
+SECOND_DEPLOYER="0x4b371F624dF6523ac3b72Df3aB35f727BEe91EB2"
+MM_WALLET_1="0x82143E6437d3d855322187165E91eBd01D99fa34"
 
 # ── USDC amounts (6 decimals) ──────────────────────────────────────────────
 MINT_ALLOWANCE=999999999000000   # ~$1B — enough for all mints
@@ -55,6 +58,28 @@ ALICE_AMOUNT=30000000000         # $30k
 BOB_AMOUNT=200000000000          # $200k
 DAVE_AMOUNT=5000000000           # $5k
 INVESTOR_AMOUNT=50000000000      # $50k each
+
+# ── Step 0: fund all wallets with ETH for gas ─────────────────────────────
+ETH_AMOUNT="0x21E19E0C9BAB2400000"  # 10,000 ETH
+
+echo "Funding wallets with ETH for gas..."
+fund_eth() {
+    local name=$1
+    local address=$2
+    cast rpc anvil_setBalance "$address" "$ETH_AMOUNT" --rpc-url "$RPC_URL" > /dev/null
+    echo "  $name ($address): 10,000 ETH"
+}
+
+fund_eth deployer  "$DEPLOYER"
+fund_eth alice     "$ALICE"
+fund_eth bob       "$BOB"
+fund_eth dave      "$DAVE"
+fund_eth investor5 "$INVESTOR5"
+fund_eth investor6 "$INVESTOR6"
+fund_eth spv       "$SPV_ADDRESS"
+fund_eth second_deployer "$SECOND_DEPLOYER"
+fund_eth mm_wallet_1 "$MM_WALLET_1"
+echo ""
 
 # ── Step 1: get masterMinter from USDC contract ────────────────────────────
 echo ""
@@ -110,6 +135,7 @@ mint_usdc bob       "$BOB"       "$BOB_AMOUNT"
 mint_usdc dave      "$DAVE"      "$DAVE_AMOUNT"
 mint_usdc investor5 "$INVESTOR5" "$INVESTOR_AMOUNT"
 mint_usdc investor6 "$INVESTOR6" "$INVESTOR_AMOUNT"
+mint_usdc mm_wallet_1 "$MM_WALLET_1" "$INVESTOR_AMOUNT"
 
 # ── Step 7: verify balances ────────────────────────────────────────────────
 echo ""
@@ -127,6 +153,7 @@ balance bob       "$BOB"
 balance dave      "$DAVE"
 balance investor5 "$INVESTOR5"
 balance investor6 "$INVESTOR6"
+balance second_deployer "$SECOND_DEPLOYER"
 
 echo ""
 echo "Done. Wallets are funded and ready."

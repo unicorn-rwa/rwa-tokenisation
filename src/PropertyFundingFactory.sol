@@ -50,11 +50,15 @@ contract PropertyFundingFactory is AccessControl {
     // Maximum allowed fundraising window — mirrors PropertyFunding.MAX_FUNDRAISING_DURATION
     uint256 public constant MAX_FUNDRAISING_DURATION = 180 days;
 
+    // Maximum investor count — mirrors PropertyFunding.MAX_INVESTORS (keep in sync)
+    uint256 public constant MAX_INVESTORS = 2000;
+
     // ─── Errors ────────────────────────────────────────────────────────────────
     error ZeroAddress();
     error InvalidParam();
     error DeadlineTooFar();
     error RoleConflict();
+    error GoalExceedsCapacity();
 
     // ─── Constructor ───────────────────────────────────────────────────────────
     constructor(
@@ -131,6 +135,9 @@ contract PropertyFundingFactory is AccessControl {
         // M-3: relational validation — min must not exceed per-investor caps
         if (minInvestment > maxAccreditedInvestment) revert InvalidParam();
         if (minInvestment > maxNonAccreditedUSInvestment) revert InvalidParam();
+        // M-B: goal must be reachable within MAX_INVESTORS at the min ticket (mirrors
+        //      PropertyFunding's constructor check) — prevents Sybil slot-exhaustion DoS.
+        if (fundingGoal > minInvestment * MAX_INVESTORS) revert GoalExceedsCapacity();
 
         // 1. Deploy PropertyToken — factory holds temp MINTER_ROLE + DEFAULT_ADMIN_ROLE
         PropertyToken token = new PropertyToken(
