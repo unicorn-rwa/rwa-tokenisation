@@ -168,8 +168,13 @@ contract KYCRegistryTest is BaseTest {
     /// @dev Any non-zero wallet with valid expiry should be verifiable
     function testFuzz_IssueAndVerify(address wallet, uint64 offsetDays) public {
         vm.assume(wallet != address(0));
-        // Keep offset in a reasonable range: 1 day to 2 years
-        offsetDays = uint64(bound(offsetDays, 1 days, 730 days));
+        // Exclude the actors pre-attested in setUp (alice/bob/dave) — re-issuing over an
+        // active attestation correctly reverts AttestationAlreadyActive (M-1), which would
+        // be a false fuzz failure here.
+        vm.assume(!registry.isVerified(wallet));
+        // Keep offset within the valid window: 1 day up to the max-duration ceiling (L-2).
+        // Beyond MAX_ATTESTATION_DURATION issueAttestation correctly reverts InvalidExpiry.
+        offsetDays = uint64(bound(offsetDays, 1 days, registry.MAX_ATTESTATION_DURATION()));
 
         vm.prank(attester);
         registry.issueAttestation(
@@ -337,6 +342,53 @@ contract KYCRegistryTest is BaseTest {
         vm.expectRevert(KYCRegistry.InvalidExpiry.selector);
         vm.prank(attester);
         registry.issueAttestation(charlie, true, false, false, "US", uint64(block.timestamp), bytes32(0));
+    }
+
+    // ─── L-2: max-duration ceiling on expiry (issue + update symmetry) ──────────
+
+    function test_RevertWhen_IssueAttestation_ExpiryBeyondMaxDuration() public {
+        // One second past the ceiling must revert — bounds compromised-attester blast radius.
+        uint64 tooFar = uint64(block.timestamp + registry.MAX_ATTESTATION_DURATION() + 1);
+        vm.expectRevert(KYCRegistry.InvalidExpiry.selector);
+        vm.prank(attester);
+        registry.issueAttestation(charlie, true, false, false, "US", tooFar, bytes32(0));
+    }
+
+    function test_IssueAttestation_ExpiryAtMaxDuration_Succeeds() public {
+        // Exactly at the ceiling is allowed (boundary).
+        uint64 atCeiling = uint64(block.timestamp + registry.MAX_ATTESTATION_DURATION());
+        vm.prank(attester);
+        registry.issueAttestation(charlie, true, false, false, "US", atCeiling, bytes32(0));
+        assertTrue(registry.isVerified(charlie));
+    }
+
+    function test_RevertWhen_UpdateExpiry_PastDate() public {
+        // Backdating via updateExpiry would silently void a valid investor — must revert.
+        // (Disabling is revokeAttestation()'s job, not a past expiry.)
+        vm.warp(block.timestamp + 10 days);
+        vm.expectRevert(KYCRegistry.InvalidExpiry.selector);
+        vm.prank(attester);
+        registry.updateExpiry(alice, uint64(block.timestamp - 1));
+    }
+
+    function test_RevertWhen_UpdateExpiry_ExpiryAtCurrentTimestamp() public {
+        vm.expectRevert(KYCRegistry.InvalidExpiry.selector);
+        vm.prank(attester);
+        registry.updateExpiry(alice, uint64(block.timestamp));
+    }
+
+    function test_RevertWhen_UpdateExpiry_BeyondMaxDuration() public {
+        uint64 tooFar = uint64(block.timestamp + registry.MAX_ATTESTATION_DURATION() + 1);
+        vm.expectRevert(KYCRegistry.InvalidExpiry.selector);
+        vm.prank(attester);
+        registry.updateExpiry(alice, tooFar);
+    }
+
+    function test_UpdateExpiry_AtMaxDuration_Succeeds() public {
+        uint64 atCeiling = uint64(block.timestamp + registry.MAX_ATTESTATION_DURATION());
+        vm.prank(attester);
+        registry.updateExpiry(alice, atCeiling);
+        assertEq(registry.getAttestation(alice).expiresAt, atCeiling);
     }
 
     // ─── L-2: revert revokeAttestation on non-existent wallet ─────────────────

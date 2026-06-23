@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Vm} from "forge-std/Vm.sol";
 import {BaseTest} from "./BaseTest.t.sol";
 import {ROIDistributor} from "../src/ROIDistributor.sol";
 import {PropertyFunding} from "../src/PropertyFunding.sol";
@@ -34,9 +35,10 @@ contract ROIDistributorTest is BaseTest {
         // Off-chain proofs (same sorted-pair algorithm as on-chain _computeMerkleRoot)
         (merkleRoot, aliceProof, bobProof) = _buildMerkleTree(alice, aliceClaim, bob, bobClaim);
 
-        // Build Claimant array for commitDistribution
-        claimants.push(ROIDistributor.Claimant({wallet: alice, amount: aliceClaim}));
-        claimants.push(ROIDistributor.Claimant({wallet: bob,   amount: bobClaim}));
+        // Build Claimant array (sorted ascending by wallet) for commitDistribution
+        ROIDistributor.Claimant[] memory sorted = _claimants2(alice, aliceClaim, bob, bobClaim);
+        claimants.push(sorted[0]);
+        claimants.push(sorted[1]);
 
         // Commit and fully fund the distributor
         vm.startPrank(spvTreasury);
@@ -58,32 +60,100 @@ contract ROIDistributorTest is BaseTest {
         assertEq(d.totalClaimed, 0);
     }
 
-    function test_CommitDistribution_StoresClaimants() public view {
-        ROIDistributor.Claimant[] memory stored = distributor.getClaimants();
-        assertEq(stored.length, 2);
-        assertEq(stored[0].wallet, alice);
-        assertEq(stored[0].amount, aliceClaim);
-        assertEq(stored[1].wallet, bob);
-        assertEq(stored[1].amount, bobClaim);
+    function test_CommitDistribution_EmitsFullClaimantList() public {
+        // The claimant list is no longer stored on-chain — it must be fully recoverable
+        // from the DistributionCommitted event (this is what the NestJS backend indexes
+        // to display/verify the distribution).
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
+
+        vm.recordLogs();
+        vm.prank(spvTreasury);
+        dist2.commitDistribution(c);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("DistributionCommitted(bytes32,uint256,uint256,(address,uint256)[])");
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            (uint256 total, uint256 count, ROIDistributor.Claimant[] memory list) =
+                abi.decode(logs[i].data, (uint256, uint256, ROIDistributor.Claimant[]));
+            assertEq(total, totalPayout);
+            assertEq(count, 2);
+            assertEq(list.length, 2);
+            assertEq(list[0].wallet, c[0].wallet);
+            assertEq(list[0].amount, c[0].amount);
+            assertEq(list[1].wallet, c[1].wallet);
+            assertEq(list[1].amount, c[1].amount);
+            found = true;
+        }
+        assertTrue(found, "DistributionCommitted event not found");
     }
 
-    function test_CommitDistribution_SetsRecoveryUnlocksAt() public view {
-        // recoveryUnlocksAt is set at commit time, not at deposit time
-        assertEq(distributor.recoveryUnlocksAt(), block.timestamp + distributor.RECOVERY_DELAY());
+    function test_RecoveryUnlocksAt_SetWhenClaimsEnabled_NotAtCommit() public {
+        // H-1: the recovery clock must start when claims OPEN (full deposit), not at
+        // commit time — otherwise a delayed deposit shrinks the investor claim window.
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
+
+        // Commit only — clock is NOT armed yet.
+        vm.prank(spvTreasury);
+        dist2.commitDistribution(c);
+        assertEq(dist2.recoveryUnlocksAt(), 0, "armed at commit time (H-1 regression)");
+
+        // Partial deposit (still underfunded) — still NOT armed.
+        usdc.mint(spvTreasury, totalPayout);
+        vm.startPrank(spvTreasury);
+        usdc.approve(address(dist2), totalPayout);
+        dist2.depositFunds(totalPayout - 1);
+        assertEq(dist2.recoveryUnlocksAt(), 0, "armed before claims enabled (H-1 regression)");
+
+        // Final deposit tips it to fully funded → claims enabled → clock armed NOW.
+        dist2.depositFunds(1);
+        vm.stopPrank();
+        assertTrue(dist2.claimsEnabled(), "claims should be enabled");
+        assertEq(
+            dist2.recoveryUnlocksAt(),
+            block.timestamp + dist2.RECOVERY_DELAY(),
+            "clock must arm at claims-enabled time"
+        );
+    }
+
+    function test_RevertWhen_RecoverCommittedButUnderfunded() public {
+        // H-1: a committed-but-never-fully-funded distribution can never be recovered —
+        // recoveryUnlocksAt stays 0, so recoverFunds() always reverts RecoveryTooEarly,
+        // even far in the future. (Use withdrawDeposit() to pull partial funds back.)
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
+        usdc.mint(spvTreasury, totalPayout);
+        vm.startPrank(spvTreasury);
+        dist2.commitDistribution(c);
+        usdc.approve(address(dist2), totalPayout);
+        dist2.depositFunds(totalPayout - 1); // underfunded by 1 — claims never enable
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 10_000 days);
+
+        vm.expectRevert(ROIDistributor.RecoveryTooEarly.selector);
+        vm.prank(spvTreasury);
+        dist2.recoverFunds();
     }
 
     function test_CommitDistribution_EmitsEvent() public {
         (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
         _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
 
-        ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](2);
-        c[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
-        c[1] = ROIDistributor.Claimant({wallet: bob,   amount: bobClaim});
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
 
         (bytes32 expectedRoot,,) = _buildMerkleTree(alice, aliceClaim, bob, bobClaim);
 
         vm.expectEmit(true, false, false, true);
-        emit ROIDistributor.DistributionCommitted(expectedRoot, totalPayout, 2);
+        emit ROIDistributor.DistributionCommitted(expectedRoot, totalPayout, 2, c);
 
         vm.prank(spvTreasury);
         dist2.commitDistribution(c);
@@ -123,7 +193,8 @@ contract ROIDistributorTest is BaseTest {
         c[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
         c[1] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim}); // duplicate
 
-        vm.expectRevert(abi.encodeWithSelector(ROIDistributor.DuplicateClaimant.selector, alice));
+        // A duplicate wallet is not strictly ascending → caught by the sorted invariant
+        vm.expectRevert(abi.encodeWithSelector(ROIDistributor.UnsortedClaimants.selector, alice));
         vm.prank(spvTreasury);
         dist2.commitDistribution(c);
     }
@@ -153,7 +224,8 @@ contract ROIDistributorTest is BaseTest {
         ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](1);
         c[0] = ROIDistributor.Claimant({wallet: address(0), amount: 1e6});
 
-        vm.expectRevert(ROIDistributor.ZeroAddress.selector);
+        // zero address can't exceed prev (address(0)) → rejected by the ascending invariant
+        vm.expectRevert(abi.encodeWithSelector(ROIDistributor.UnsortedClaimants.selector, address(0)));
         vm.prank(spvTreasury);
         dist2.commitDistribution(c);
     }
@@ -176,9 +248,7 @@ contract ROIDistributorTest is BaseTest {
         (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
         _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
 
-        ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](2);
-        c[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
-        c[1] = ROIDistributor.Claimant({wallet: bob,   amount: bobClaim});
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
 
         vm.prank(spvTreasury);
         dist2.commitDistribution(c);
@@ -210,9 +280,7 @@ contract ROIDistributorTest is BaseTest {
         (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
         _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
 
-        ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](2);
-        c[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
-        c[1] = ROIDistributor.Claimant({wallet: bob,   amount: bobClaim});
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
 
         usdc.mint(spvTreasury, totalPayout);
         vm.startPrank(spvTreasury);
@@ -261,9 +329,7 @@ contract ROIDistributorTest is BaseTest {
         (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
         _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
 
-        ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](2);
-        c[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
-        c[1] = ROIDistributor.Claimant({wallet: bob,   amount: bobClaim});
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
 
         uint256 halfAmount = totalPayout / 2;
         usdc.mint(spvTreasury, halfAmount);
@@ -335,12 +401,9 @@ contract ROIDistributorTest is BaseTest {
         assertEq(d.merkleRoot, bytes32(0));
         assertEq(d.totalRequired, 0);
         assertEq(dist2.recoveryUnlocksAt(), 0);
-        assertEq(dist2.getClaimants().length, 0);
 
         // Can recommit with corrected data
-        ROIDistributor.Claimant[] memory correct = new ROIDistributor.Claimant[](2);
-        correct[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
-        correct[1] = ROIDistributor.Claimant({wallet: bob,   amount: bobClaim});
+        ROIDistributor.Claimant[] memory correct = _claimants2(alice, aliceClaim, bob, bobClaim);
 
         vm.prank(spvTreasury);
         dist2.commitDistribution(correct);
@@ -385,7 +448,7 @@ contract ROIDistributorTest is BaseTest {
 
         uint256 treasuryBefore = usdc.balanceOf(spvTreasury);
 
-        // Warp past RECOVERY_DELAY (set at commitDistribution time = block.timestamp at setUp)
+        // Warp past RECOVERY_DELAY (armed when claims enabled in setUp = block.timestamp)
         vm.warp(distributor.recoveryUnlocksAt() + 1);
 
         vm.prank(spvTreasury);
@@ -474,9 +537,7 @@ contract ROIDistributorTest is BaseTest {
         _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
 
         // Committed but not fully funded
-        ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](2);
-        c[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
-        c[1] = ROIDistributor.Claimant({wallet: bob,   amount: bobClaim});
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
 
         usdc.mint(spvTreasury, totalPayout / 2);
         vm.startPrank(spvTreasury);
@@ -524,7 +585,7 @@ contract ROIDistributorTest is BaseTest {
         vm.startPrank(multisig);
         funding.withdrawFunds();
         funding.setActive();
-        funding.setCompleted();
+        funding.setCompleted(ROI_BPS);
         vm.stopPrank();
     }
 
@@ -536,7 +597,146 @@ contract ROIDistributorTest is BaseTest {
         vm.startPrank(multisig);
         f.withdrawFunds();
         f.setActive();
-        f.setCompleted();
+        f.setCompleted(ROI_BPS);
         vm.stopPrank();
+    }
+
+    // ─── H-B: commitDistribution scale ─────────────────────────────────────────
+
+    /// @dev Build n claimants with strictly-ascending wallets (commit ordering invariant).
+    function _bigClaimants(uint256 n) internal pure returns (ROIDistributor.Claimant[] memory c) {
+        c = new ROIDistributor.Claimant[](n);
+        for (uint256 i = 0; i < n; i++) {
+            c[i] = ROIDistributor.Claimant({wallet: address(uint160(0x100000 + i)), amount: 1_000e6 + i});
+        }
+    }
+
+    /// @notice Gas regression: commitDistribution at the MAX_CLAIMANTS cap must stay well
+    ///         within a block. Variant C (sorted O(n) dedup + event-only list) measures
+    ///         ~6M execution gas at 2000; we assert a generous 10M ceiling so any regression
+    ///         (e.g. accidentally re-introducing on-chain claimant storage) trips this.
+    function test_Gas_CommitDistribution_AtMaxClaimants() public {
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+
+        uint256 n = dist2.MAX_CLAIMANTS(); // 2000
+        ROIDistributor.Claimant[] memory c = _bigClaimants(n);
+
+        vm.prank(spvTreasury);
+        uint256 g0 = gasleft();
+        dist2.commitDistribution(c);
+        uint256 used = g0 - gasleft();
+        emit log_named_uint("commitDistribution gas @ MAX_CLAIMANTS", used);
+        assertLt(used, 10_000_000, "commitDistribution gas regressed above 10M");
+    }
+
+    function test_RevertWhen_CommitExceedsMaxClaimants() public {
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+
+        ROIDistributor.Claimant[] memory c = _bigClaimants(dist2.MAX_CLAIMANTS() + 1);
+
+        vm.expectRevert(ROIDistributor.TooManyClaimants.selector);
+        vm.prank(spvTreasury);
+        dist2.commitDistribution(c);
+    }
+
+    function test_RevertWhen_CommitUnsortedClaimants() public {
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+
+        // Descending wallets — second entry is not > first
+        ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](2);
+        c[0] = ROIDistributor.Claimant({wallet: address(0x20), amount: 1e6});
+        c[1] = ROIDistributor.Claimant({wallet: address(0x10), amount: 1e6});
+
+        vm.expectRevert(abi.encodeWithSelector(ROIDistributor.UnsortedClaimants.selector, address(0x10)));
+        vm.prank(spvTreasury);
+        dist2.commitDistribution(c);
+    }
+
+    // ─── I-3: per-claim entitlement cap ─────────────────────────────────────────
+
+    /// @dev A compromised tree-builder commits a VALID tree that massively over-pays a real
+    ///      investor. The proof verifies, but the on-chain cap rejects it — the protection
+    ///      against an inflated distribution list that the Merkle check alone can't catch.
+    function test_RevertWhen_Claim_ExceedsEntitlement_MaliciousTree() public {
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6); // alice principal = 25_000e6, finalROIBps = ROI_BPS
+
+        uint256 inflated = 100_000e6; // ≫ 25k * 1.1525 cap
+        uint256 bobAmt   = 175_000e6;
+        (, bytes32[] memory aliceP,) = _buildMerkleTree(alice, inflated, bob, bobAmt);
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, inflated, bob, bobAmt);
+
+        uint256 total = inflated + bobAmt;
+        usdc.mint(spvTreasury, total);
+        vm.startPrank(spvTreasury);
+        usdc.approve(address(dist2), total);
+        dist2.commitDistribution(c);
+        dist2.depositFunds(total);
+        vm.stopPrank();
+
+        uint256 cap = 25_000e6 * (10_000 + ROI_BPS + dist2.CLAIM_CAP_BUFFER_BPS()) / 10_000;
+        vm.expectRevert(
+            abi.encodeWithSelector(ROIDistributor.ClaimExceedsEntitlement.selector, inflated, cap)
+        );
+        vm.prank(alice);
+        dist2.claim(inflated, aliceP); // valid proof, but over the cap
+    }
+
+    /// @dev A wallet that never invested (principal 0 ⇒ cap 0) cannot claim even with a
+    ///      valid proof in a fabricated tree.
+    function test_RevertWhen_Claim_NonInvestorInTree() public {
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+
+        uint256 bobAmt     = 175_000e6 + (175_000e6 * ROI_BPS / 10_000);
+        uint256 charlieAmt = 1e6; // charlie never invested
+        (, bytes32[] memory bobP, bytes32[] memory charlieP) =
+            _buildMerkleTree(bob, bobAmt, charlie, charlieAmt);
+        ROIDistributor.Claimant[] memory c = _claimants2(bob, bobAmt, charlie, charlieAmt);
+
+        uint256 total = bobAmt + charlieAmt;
+        usdc.mint(spvTreasury, total);
+        vm.startPrank(spvTreasury);
+        usdc.approve(address(dist2), total);
+        dist2.commitDistribution(c);
+        dist2.depositFunds(total);
+        vm.stopPrank();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ROIDistributor.ClaimExceedsEntitlement.selector, charlieAmt, uint256(0))
+        );
+        vm.prank(charlie);
+        dist2.claim(charlieAmt, charlieP);
+
+        // Sanity: the real investor in the same tree still claims fine.
+        vm.prank(bob);
+        dist2.claim(bobAmt, bobP);
+    }
+
+    /// @dev A claim exactly at the cap (principal * (1 + finalROI + buffer)) is allowed —
+    ///      the buffer guarantees honest pro-rata rounding never over-rejects.
+    function test_Claim_AtEntitlementCap_Succeeds() public {
+        (PropertyFunding f2,, ROIDistributor dist2) = _createProject();
+        _advanceToCompletedFor(f2, 25_000e6, 175_000e6);
+
+        uint256 cap    = 25_000e6 * (10_000 + ROI_BPS + dist2.CLAIM_CAP_BUFFER_BPS()) / 10_000;
+        uint256 bobAmt = 175_000e6;
+        (, bytes32[] memory aliceP,) = _buildMerkleTree(alice, cap, bob, bobAmt);
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, cap, bob, bobAmt);
+
+        uint256 total = cap + bobAmt;
+        usdc.mint(spvTreasury, total);
+        vm.startPrank(spvTreasury);
+        usdc.approve(address(dist2), total);
+        dist2.commitDistribution(c);
+        dist2.depositFunds(total);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        dist2.claim(cap, aliceP); // exactly at the cap → allowed
+        assertEq(usdc.balanceOf(alice), cap);
     }
 }

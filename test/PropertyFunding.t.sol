@@ -373,7 +373,7 @@ contract PropertyFundingTest is BaseTest {
 
         // 4. Construction completes
         vm.prank(multisig);
-        funding.setCompleted();
+        funding.setCompleted(ROI_BPS);
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.COMPLETED));
 
         // Token holders confirmed — ROIDistributor takes over from here
@@ -743,43 +743,214 @@ contract PropertyFundingTest is BaseTest {
         t.mint(roi, 1_000e18);
     }
 
-    // ─── L-3: MAX_INVESTORS cap ────────────────────────────────────────────────
+    // ─── M-B: goal must be reachable within MAX_INVESTORS at the min ticket ─────
+    //
+    // This invariant makes the Sybil slot-exhaustion DoS impossible: you can never fill
+    // all investor slots without meeting the goal (which is acceptable — that just funds
+    // the project). As a consequence the TooManyInvestors cap is unreachable via invest();
+    // it remains as a defense-in-depth backstop.
 
-    function test_RevertWhen_InvestorCountExceedsMax() public {
-        // Create a project with a tiny funding goal so we can fill it with many investors
-        // Use a fresh project to avoid polluting setUp's funding
+    function test_RevertWhen_FundingGoal_ExceedsInvestorCapacity() public {
+        // goal one wei above minInvestment * MAX_INVESTORS must be rejected at creation
+        uint256 capacity = MIN_INVESTMENT * factory.MAX_INVESTORS();
+        vm.expectRevert(PropertyFundingFactory.GoalExceedsCapacity.selector);
         vm.prank(admin);
-        (address f,,) = factory.createProject(
-            "PropToken Cap", "PROP-CAP",
+        factory.createProject(
+            "PropToken OverCap", "PROP-OVER",
             multisig, spvTreasury,
-            type(uint256).max,               // effectively unlimited goal
+            capacity + 1,                    // exceeds capacity by 1 wei
             block.timestamp + DEADLINE_OFFSET,
             ROI_BPS, block.timestamp + 60 days, block.timestamp + 540 days,
             MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT, MAX_NON_ACCREDITED_INVESTMENT,
             "ipfs://QmTestHash"
         );
-        PropertyFunding capFunding = PropertyFunding(f);
-        uint256 cap = capFunding.MAX_INVESTORS();
+    }
 
-        // Register and invest for exactly MAX_INVESTORS unique Reg S wallets
-        for (uint256 i = 0; i < cap; i++) {
-            address inv = makeAddr(string(abi.encodePacked("regSInvestor", i)));
+    function test_FundingGoal_AtExactCapacity_Allowed() public {
+        // goal == minInvestment * MAX_INVESTORS is the tightest allowed value
+        uint256 capacity = MIN_INVESTMENT * factory.MAX_INVESTORS();
+        vm.prank(admin);
+        (address f,,) = factory.createProject(
+            "PropToken AtCap", "PROP-AT",
+            multisig, spvTreasury,
+            capacity,
+            block.timestamp + DEADLINE_OFFSET,
+            ROI_BPS, block.timestamp + 60 days, block.timestamp + 540 days,
+            MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT, MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+        assertEq(PropertyFunding(f).fundingGoal(), capacity);
+    }
+
+    function test_FundingGoal_CapReachedMeansGoalMet() public {
+        // Prove the invariant in action: with goal == minInvestment * N, the Nth investor
+        // at the minimum ticket tips the raise to FUNDED — slots can't fill without funding.
+        // Use a small N so the test stays cheap (5 investors).
+        uint256 n = 5;
+        uint256 goal = MIN_INVESTMENT * n;
+        vm.prank(admin);
+        (address f,,) = factory.createProject(
+            "PropToken SmallCap", "PROP-SM",
+            multisig, spvTreasury,
+            goal,
+            block.timestamp + DEADLINE_OFFSET,
+            ROI_BPS, block.timestamp + 60 days, block.timestamp + 540 days,
+            MIN_INVESTMENT, MAX_ACCREDITED_INVESTMENT, MAX_NON_ACCREDITED_INVESTMENT,
+            "ipfs://QmTestHash"
+        );
+        PropertyFunding sm = PropertyFunding(f);
+
+        for (uint256 i = 0; i < n; i++) {
+            address inv = makeAddr(string(abi.encodePacked("smInvestor", i)));
             vm.prank(attester);
             registry.issueAttestation(inv, false, false, true, "UA", uint64(block.timestamp + 365 days), bytes32(0));
             _fundInvestor(inv, f, MIN_INVESTMENT);
             vm.prank(inv);
-            capFunding.invest(MIN_INVESTMENT);
+            sm.invest(MIN_INVESTMENT);
         }
-        assertEq(capFunding.investorCount(), cap);
 
-        // One more unique investor should revert
-        address overflow = makeAddr("overflowInvestor");
+        // Goal met exactly at the Nth investor → FUNDED, no further slots available
+        assertEq(uint8(sm.state()), uint8(PropertyFunding.State.FUNDED));
+        assertEq(sm.investorCount(), n);
+
+        // A further investor cannot join — blocked by state, not by the cap
+        address late = makeAddr("lateInvestor");
         vm.prank(attester);
-        registry.issueAttestation(overflow, false, false, true, "UA", uint64(block.timestamp + 365 days), bytes32(0));
-        _fundInvestor(overflow, f, MIN_INVESTMENT);
+        registry.issueAttestation(late, false, false, true, "UA", uint64(block.timestamp + 365 days), bytes32(0));
+        _fundInvestor(late, f, MIN_INVESTMENT);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PropertyFunding.WrongState.selector,
+                PropertyFunding.State.FUNDRAISING,
+                PropertyFunding.State.FUNDED
+            )
+        );
+        vm.prank(late);
+        sm.invest(MIN_INVESTMENT);
+    }
 
-        vm.expectRevert(PropertyFunding.TooManyInvestors.selector);
-        vm.prank(overflow);
-        capFunding.invest(MIN_INVESTMENT);
+    // ─── L-3: sweepStrayUSDC() ─────────────────────────────────────────────────
+
+    /// @dev Drive the project to WITHDRAWN (goal met → withdrawn) and return.
+    function _toWithdrawn() internal {
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
+        funding.invest(FUNDING_GOAL); // → FUNDED
+        vm.prank(multisig);
+        funding.withdrawFunds();      // → WITHDRAWN (totalRaised leaves to treasury)
+    }
+
+    function test_SweepStrayUSDC_AfterWithdrawn_SendsFullBalanceToTreasury() public {
+        _toWithdrawn();
+        // Someone fat-fingers a USDC transfer straight to the funding contract.
+        uint256 stray = 1_234e6;
+        usdc.mint(address(funding), stray);
+
+        assertEq(funding.strayUSDC(), stray);
+        uint256 treasuryBefore = usdc.balanceOf(spvTreasury);
+
+        vm.expectEmit(true, false, false, true);
+        emit PropertyFunding.StrayFundsSwept(spvTreasury, stray);
+        vm.prank(multisig);
+        funding.sweepStrayUSDC();
+
+        assertEq(usdc.balanceOf(spvTreasury), treasuryBefore + stray);
+        assertEq(usdc.balanceOf(address(funding)), 0);
+    }
+
+    function test_SweepStrayUSDC_AfterCompleted_Works() public {
+        _toWithdrawn();
+        vm.startPrank(multisig);
+        funding.setActive();
+        funding.setCompleted(ROI_BPS);
+        vm.stopPrank();
+
+        usdc.mint(address(funding), 500e6);
+        assertEq(funding.strayUSDC(), 500e6);
+
+        vm.prank(multisig);
+        funding.sweepStrayUSDC();
+        assertEq(usdc.balanceOf(address(funding)), 0);
+    }
+
+    function test_RevertWhen_SweepDuringFundraising_EvenWithStray() public {
+        // Stray USDC present, but the raise is live → every USDC is treated as owed.
+        usdc.mint(address(funding), 999e6);
+        assertEq(funding.strayUSDC(), 0);
+
+        vm.expectRevert(PropertyFunding.NothingToSweep.selector);
+        vm.prank(multisig);
+        funding.sweepStrayUSDC();
+    }
+
+    function test_RevertWhen_SweepDuringFunded() public {
+        _fundInvestor(bob, address(funding), FUNDING_GOAL);
+        vm.prank(bob);
+        funding.invest(FUNDING_GOAL); // → FUNDED (not yet withdrawn)
+        usdc.mint(address(funding), 999e6);
+
+        assertEq(funding.strayUSDC(), 0);
+        vm.expectRevert(PropertyFunding.NothingToSweep.selector);
+        vm.prank(multisig);
+        funding.sweepStrayUSDC();
+    }
+
+    function test_SweepStrayUSDC_DuringRefunding_PreservesUnclaimedRefunds() public {
+        // alice + dave invest below goal; deadline passes → REFUNDING.
+        _fundInvestor(alice, address(funding), MIN_INVESTMENT);
+        vm.prank(alice);
+        funding.invest(MIN_INVESTMENT);
+        _fundInvestor(dave, address(funding), MIN_INVESTMENT);
+        vm.prank(dave);
+        funding.invest(MIN_INVESTMENT);
+
+        vm.warp(block.timestamp + DEADLINE_OFFSET + 1);
+        vm.prank(alice);
+        funding.triggerRefund(); // → REFUNDING
+
+        // Stray USDC lands on top of the two owed refunds.
+        uint256 stray = 300e6;
+        usdc.mint(address(funding), stray);
+
+        // Owed = totalRaised - totalRefunded = 2 * MIN_INVESTMENT (nobody refunded yet).
+        assertEq(funding.strayUSDC(), stray, "should only see the stray amount");
+
+        // Sweep takes ONLY the stray; the two refunds stay fully funded.
+        vm.prank(multisig);
+        funding.sweepStrayUSDC();
+        assertEq(usdc.balanceOf(address(funding)), MIN_INVESTMENT * 2, "owed refunds must remain");
+
+        // Both investors can still claim in full.
+        vm.prank(alice);
+        funding.claimRefund();
+        vm.prank(dave);
+        funding.claimRefund();
+        assertEq(funding.investments(alice), 0);
+        assertEq(funding.investments(dave), 0);
+        assertEq(funding.totalRefunded(), MIN_INVESTMENT * 2);
+        assertEq(usdc.balanceOf(address(funding)), 0);
+
+        // Nothing left to sweep now.
+        vm.expectRevert(PropertyFunding.NothingToSweep.selector);
+        vm.prank(multisig);
+        funding.sweepStrayUSDC();
+    }
+
+    function test_RevertWhen_SweepNonAdmin() public {
+        _toWithdrawn();
+        usdc.mint(address(funding), 100e6);
+
+        vm.expectRevert();
+        vm.prank(bob); // not ADMIN_ROLE
+        funding.sweepStrayUSDC();
+    }
+
+    function test_RevertWhen_SweepNothingToSweep_CleanWithdrawn() public {
+        _toWithdrawn(); // balance is exactly 0 — totalRaised already left
+        assertEq(funding.strayUSDC(), 0);
+
+        vm.expectRevert(PropertyFunding.NothingToSweep.selector);
+        vm.prank(multisig);
+        funding.sweepStrayUSDC();
     }
 }

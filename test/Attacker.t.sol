@@ -371,7 +371,7 @@ contract AttackerTest is BaseTest {
             )
         );
         vm.prank(multisig);
-        funding.setCompleted();
+        funding.setCompleted(ROI_BPS);
     }
 
     /// @dev Attacker tries to trigger a refund before the deadline — too early
@@ -468,7 +468,7 @@ contract AttackerTest is BaseTest {
         vm.startPrank(multisig);
         funding.withdrawFunds();
         funding.setActive();
-        funding.setCompleted();
+        funding.setCompleted(ROI_BPS);
         vm.stopPrank();
 
         uint256 bobClaim = FUNDING_GOAL + (FUNDING_GOAL * ROI_BPS / 10_000);
@@ -508,7 +508,7 @@ contract AttackerTest is BaseTest {
         vm.startPrank(multisig);
         funding.withdrawFunds();
         funding.setActive();
-        funding.setCompleted();
+        funding.setCompleted(ROI_BPS);
         vm.stopPrank();
 
         uint256 bobClaim = FUNDING_GOAL + (FUNDING_GOAL * ROI_BPS / 10_000);
@@ -838,7 +838,7 @@ contract AttackerTest is BaseTest {
         vm.startPrank(multisig);
         funding.withdrawFunds();
         funding.setActive();
-        funding.setCompleted();
+        funding.setCompleted(ROI_BPS);
         vm.stopPrank();
     }
 
@@ -857,9 +857,7 @@ contract AttackerTest is BaseTest {
         uint256 bobClaim   = 175_000e6 + (175_000e6 * ROI_BPS / 10_000);
         uint256 total      = aliceClaim + bobClaim;
 
-        ROIDistributor.Claimant[] memory c = new ROIDistributor.Claimant[](2);
-        c[0] = ROIDistributor.Claimant({wallet: alice, amount: aliceClaim});
-        c[1] = ROIDistributor.Claimant({wallet: bob,   amount: bobClaim});
+        ROIDistributor.Claimant[] memory c = _claimants2(alice, aliceClaim, bob, bobClaim);
 
         usdc.mint(spvTreasury, total);
         vm.startPrank(spvTreasury);

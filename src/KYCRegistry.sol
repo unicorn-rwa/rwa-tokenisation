@@ -50,13 +50,22 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
     bytes32 public constant ATTESTER_ROLE = keccak256("ATTESTER_ROLE");
     bytes32 public constant PAUSER_ROLE   = keccak256("PAUSER_ROLE");
 
+    /// @notice Hard ceiling on how far in the future an attestation may expire (L-2).
+    ///         Bounds the blast radius of a compromised attester hot wallet: no single
+    ///         write — issue or renew — can mint an attestation that outlives this window,
+    ///         so any bad state self-expires once the key is rotated. 366 days (not 365)
+    ///         gives one day of headroom so the backend's `now + 365 days` writes never
+    ///         revert on on-chain/off-chain timestamp skew. Enforced by both
+    ///         issueAttestation() and updateExpiry().
+    uint64 public constant MAX_ATTESTATION_DURATION = 366 days;
+
     struct Attestation {
         bool    kycPassed;
         bool    accreditedInvestor; // Reg D 506(c) — US accredited       (max $25k/project)
         bool    nonAccreditedUS;    // Reg D 506(b) — US non-accredited   (max $2.5k/project)
         bool    regSEligible;       // Reg S        — non-US investor      (country-level limits)
         bytes2  countryCode;        // ISO 3166-1 alpha-2, e.g. "US", "UA"
-        uint64  expiresAt;          // unix timestamp — attestations expire (max 1 yr)
+        uint64  expiresAt;          // unix timestamp — attestations expire (<= MAX_ATTESTATION_DURATION ahead)
         bool    revoked;
     }
 
@@ -105,6 +114,8 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
         if (isVerified(wallet)) revert AttestationAlreadyActive();
         // M-1: prevent past-dated issuance that silently "issues" an already-expired attestation
         if (expiresAt <= block.timestamp) revert InvalidExpiry();
+        // L-2: enforce the max-duration ceiling so no attestation outlives the recovery window
+        if (expiresAt > block.timestamp + MAX_ATTESTATION_DURATION) revert InvalidExpiry();
 
         // Investor types are mutually exclusive — exactly one must be set
         uint8 typeCount = (accreditedInvestor ? 1 : 0)
@@ -144,6 +155,12 @@ contract KYCRegistry is IKYCRegistry, AccessControl, Pausable {
     function updateExpiry(address wallet, uint64 newExpiry) external onlyRole(ATTESTER_ROLE) {
         if (!_attestations[wallet].kycPassed) revert AttestationNotFound();
         if (_attestations[wallet].revoked) revert AlreadyRevoked();
+        // L-2: mirror issueAttestation()'s expiry guards so neither write path can produce
+        //      a state the other forbids. Reject past dates (use revokeAttestation() to
+        //      disable — a backdated expiry would silently void a valid investor) and
+        //      reject anything beyond the max-duration ceiling.
+        if (newExpiry <= block.timestamp) revert InvalidExpiry();
+        if (newExpiry > block.timestamp + MAX_ATTESTATION_DURATION) revert InvalidExpiry();
         _attestations[wallet].expiresAt = newExpiry;
         emit AttestationUpdated(wallet, newExpiry);
     }
