@@ -223,8 +223,10 @@ rwa/
 │   ├── KYCRegistry.t.sol             unit + fuzz tests for registry
 │   ├── PropertyToken.t.sol           unit + fuzz tests for token compliance
 │   ├── PropertyFunding.t.sol         unit + fuzz + lifecycle integration tests
-│   ├── ROIDistributor.t.sol          Merkle claim tests
-│   └── Attacker.t.sol                36 adversarial tests (all must PASS = contract rejects attack)
+│   ├── ROIDistributor.t.sol          Merkle claim + deposit/recovery + claim-cap tests
+│   ├── Attacker.t.sol                38 adversarial tests (all must PASS = contract rejects attack)
+│   ├── MerkleVector.t.sol            golden Merkle roots (cross-checked vs the offline operator tool)
+│   └── FactorySize.t.sol             asserts the factory stays under the EIP-170 24 KB limit
 │
 └── script/
     └── Deploy.s.sol                  deploys KYCRegistry + ROIDistributor + Factory
