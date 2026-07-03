@@ -271,15 +271,17 @@ forge test --match-test "test_Attack_ReentrancyOnClaimRefund" -vvvv
 forge test --match-test "testFuzz" --fuzz-runs 1000
 ```
 
-Current coverage: **92 tests, 0 failing**
+Current coverage: **186 tests, 0 failing**
 
 | Suite | Tests | Notes |
 |---|---|---|
-| `KYCRegistry.t.sol` | 15 | includes `testFuzz_IssueAndVerify` (256 runs) |
-| `PropertyToken.t.sol` | 11 | includes `testFuzz_MintBurn_BalanceConsistency` |
-| `PropertyFunding.t.sol` | 20 | includes 2 fuzz tests + full lifecycle integration |
-| `ROIDistributor.t.sol` | 10 | Merkle proof correctness + double-claim prevention |
-| `Attacker.t.sol` | 36 | All attacks must be **rejected** — PASS = contract is safe |
+| `KYCRegistry.t.sol` | 42 | attestation lifecycle, expiry ceiling (L-2), country restrictions, `testFuzz_IssueAndVerify` |
+| `PropertyToken.t.sol` | 7 | non-transferable ERC-20, mint/burn role split (L-5), balance-consistency fuzz |
+| `PropertyFunding.t.sol` | 55 | full lifecycle + fuzz; refunds, escape hatch, stray-USDC sweep (L-3), investor cap |
+| `ROIDistributor.t.sol` | 42 | Merkle claim correctness, deposit/recovery timing (H-1), per-claim cap (I-3), double-claim prevention |
+| `Attacker.t.sol` | 38 | All attacks must be **rejected** — PASS = contract is safe |
+| `MerkleVector.t.sol` | 1 | golden Merkle roots cross-checked against the offline operator tool |
+| `FactorySize.t.sol` | 1 | asserts the factory stays under the EIP-170 24 KB runtime limit |
 
 ---
 
