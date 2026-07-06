@@ -20,6 +20,7 @@ set -euo pipefail
 #   ./script/seed-failed-campaign.sh
 #   MM_WALLET_PK=0x<your-wallet-key> ./script/seed-failed-campaign.sh   # also invest from your wallet
 #
+
 # Env overrides: RPC_URL, FACTORY_ADDRESS, ADMIN_PK, DEADLINE_SECONDS, WARP_SECONDS,
 #                TOKEN_NAME, TOKEN_SYMBOL, FUNDING_GOAL (forwarded to PropertyDeploy).
 # ─────────────────────────────────────────────────────────────────────────────
