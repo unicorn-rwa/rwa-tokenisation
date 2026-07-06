@@ -75,16 +75,18 @@ contract Deploy is Script {
         address attester;
 
         if (isLocal) {
-            usdc     = USDC_SEPOLIA;
+            usdc     = vm.envOr("USDC_ADDRESS", USDC_SEPOLIA); // allow a MockUSDC override
             admin    = ANVIL_ADMIN;
             attester = ANVIL_ATTESTER;
         } else if (isMainnet) {
-            usdc     = USDC_MAINNET;
+            usdc     = USDC_MAINNET; // real Circle USDC — NEVER overridable on mainnet
             admin    = vm.envAddress("ADMIN_ADDRESS");
             attester = vm.envAddress("ATTESTER_ADDRESS");
         } else {
-            // testnet (default for non-local, non-mainnet)
-            usdc     = USDC_SEPOLIA;
+            // testnet (default for non-local, non-mainnet). Default to Base Sepolia USDC,
+            // but allow a MockUSDC override via USDC_ADDRESS so testing isn't throttled by
+            // the ~20-USDC-per-request faucet cap (MockUSDC has a free public mint).
+            usdc     = vm.envOr("USDC_ADDRESS", USDC_SEPOLIA);
             admin    = vm.envAddress("ADMIN_ADDRESS");
             attester = vm.envAddress("ATTESTER_ADDRESS");
         }
