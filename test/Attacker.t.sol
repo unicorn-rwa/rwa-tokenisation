@@ -415,7 +415,7 @@ contract AttackerTest is BaseTest {
     }
 
     /// @dev Attacker (non-investor) tries to force REFUNDING on a successfully FUNDED
-    ///      project — even after the 30-day withdrawal timeout has elapsed they are
+    ///      project — even after the 60-day withdrawal timeout has elapsed they are
     ///      blocked because they never invested. NotAnInvestor fires first.
     function test_Attack_TriggerRefundAfterGoalMet() public {
         _fundInvestor(bob, address(funding), FUNDING_GOAL);

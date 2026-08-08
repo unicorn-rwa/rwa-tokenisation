@@ -198,7 +198,7 @@ contract PropertyFundingTest is BaseTest {
         assertEq(uint8(funding.state()), uint8(PropertyFunding.State.FUNDED));
         assertEq(funding.fundedAt(), block.timestamp);
 
-        // Warp to just before the 30-day timeout
+        // Warp to just before the 60-day timeout
         vm.warp(block.timestamp + funding.WITHDRAWAL_TIMEOUT() - 1);
 
         vm.expectRevert(PropertyFunding.WithdrawalTimeoutNotReached.selector);
@@ -209,7 +209,7 @@ contract PropertyFundingTest is BaseTest {
     // ─── H-1 escape hatch (FUNDED timeout) ────────────────────────────────────
 
     function test_TriggerRefund_FromFunded_AfterTimeout() public {
-        // Admin goes dark — never calls withdrawFunds(). After 30 days any
+        // Admin goes dark — never calls withdrawFunds(). After 60 days any
         // investor can force REFUNDING and recover their USDC.
         _fundInvestor(bob, address(funding), FUNDING_GOAL);
         vm.prank(bob);
@@ -224,7 +224,7 @@ contract PropertyFundingTest is BaseTest {
     }
 
     function test_WithdrawFunds_DisarmsTimeout() public {
-        // Admin acts on day 25 — well within the 30-day window.
+        // Admin acts on day 25 — well within the 60-day window.
         // After withdrawal state is WITHDRAWN; triggerRefund() from WITHDRAWN
         // reverts with WrongState — the escape hatch is disarmed.
         _fundInvestor(bob, address(funding), FUNDING_GOAL);

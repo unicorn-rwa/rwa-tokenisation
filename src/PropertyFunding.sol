@@ -76,7 +76,7 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
 
     // How long admin has to call withdrawFunds() after goal is met before
     // investors can force a refund (H-1 escape hatch)
-    uint256 public constant WITHDRAWAL_TIMEOUT = 30 days;
+    uint256 public constant WITHDRAWAL_TIMEOUT = 60 days;
 
     // L-3: cap investor count so ROIDistributor.commitDistribution() gas stays bounded.
     // After the H-B rework (sorted O(n) dedup + event-only claimant list) commitDistribution
@@ -354,7 +354,7 @@ contract PropertyFunding is AccessControl, Pausable, ReentrancyGuard {
      *
      *   1. FUNDRAISING: deadline passed and goal was not met (original path).
      *   2. FUNDED: goal was met but admin failed to call withdrawFunds() within
-     *              WITHDRAWAL_TIMEOUT (30 days). USDC is still in this contract,
+     *              WITHDRAWAL_TIMEOUT (60 days). USDC is still in this contract,
      *              so a full refund is possible.
      *
      * In both cases no admin action is required — any investor can call this.
